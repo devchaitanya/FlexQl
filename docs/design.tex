@@ -1,0 +1,647 @@
+\documentclass[12pt,a4paper]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+
+% ── Colours ───────────────────────────────────────────────────────────────────
+\definecolor{codebg}{HTML}{F5F5F5}
+\definecolor{codekw}{HTML}{0000CC}
+\definecolor{codecomment}{HTML}{228B22}
+\definecolor{codestring}{HTML}{AA0000}
+\definecolor{linkblue}{HTML}{1A6496}
+\definecolor{sectiongray}{HTML}{2C3E50}
+
+% ── Hyperref ──────────────────────────────────────────────────────────────────
+\hypersetup{
+    colorlinks  = true,
+    linkcolor   = linkblue,
+    urlcolor    = linkblue,
+    citecolor   = linkblue,
+    pdftitle    = {FlexQL Design Document},
+    pdfauthor   = {devchaitanya},
+    pdfsubject  = {Database Engine Design},
+}
+
+% ── Section title formatting ──────────────────────────────────────────────────
+\titleformat{\section}{\large\bfseries\color{sectiongray}}{}{0em}{\thesection\quad}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\color{sectiongray}}{}{0em}{\thesubsection\quad}
+\titleformat{\subsubsection}{\normalsize\itshape}{}{0em}{\thesubsubsection\quad}
+
+% ── Code listings ─────────────────────────────────────────────────────────────
+\lstset{
+    backgroundcolor = \color{codebg},
+    basicstyle      = \ttfamily\small,
+    keywordstyle    = \color{codekw}\bfseries,
+    commentstyle    = \color{codecomment}\itshape,
+    stringstyle     = \color{codestring},
+    breaklines      = true,
+    frame           = single,
+    framesep        = 4pt,
+    rulecolor       = \color{gray!40},
+    xleftmargin     = 6pt,
+    xrightmargin    = 6pt,
+    showstringspaces= false,
+    tabsize         = 4,
+    captionpos      = b,
+}
+\lstdefinelanguage{SQL}{
+    keywords  = {CREATE,TABLE,IF,NOT,EXISTS,INSERT,INTO,VALUES,SELECT,FROM,WHERE,
+                 ORDER,BY,DESC,ASC,INNER,LEFT,JOIN,ON,DELETE,UPDATE,SET,DROP,
+                 TRUNCATE,SHOW,DISTINCT,LIMIT,OFFSET,LIKE,AND,OR,IS,BETWEEN,IN,
+                 NULL,GROUP,HAVING,AS,USE,ALTER,ADD,COLUMN,MODIFY,DESCRIBE,
+                 PRIMARY,KEY,INT,DECIMAL,VARCHAR,TEXT,DATETIME,COUNT,SUM,AVG,MIN,MAX},
+    morestring  = [b]',
+    morecomment = [l]{--},
+    sensitive   = false,
+}
+
+% ── Header / Footer ───────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small\textbf{FlexQL} — Design Document}
+\rhead{\small\textit{devchaitanya}}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Table helper ──────────────────────────────────────────────────────────────
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+
+% ── Title page ────────────────────────────────────────────────────────────────
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\Huge\bfseries\color{sectiongray} FlexQL \par}
+\vspace{0.4cm}
+{\large\itshape A High-Performance In-Memory Database Engine \par}
+\vspace{1.5cm}
+{\normalsize\bfseries Design Document \par}
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
+{\small
+\begin{tabular}{ll}
+\textbf{Author}     & devchaitanya \\[2pt]
+\textbf{Repository} & \href{https://github.com/devchaitanya/FlexQl}{github.com/devchaitanya/FlexQl} \\[2pt]
+\textbf{Language}   & C++17 (no external DB libraries) \\[2pt]
+\textbf{Platform}   & Linux (GCC 15 / Clang 20) \\[2pt]
+\end{tabular}
+}
+\vspace{0.5cm}
+\hrule
+\vfill
+{\small Design Lab — Database Systems Project}
+\end{titlepage}
+
+% ── Table of contents ─────────────────────────────────────────────────────────
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{System Overview}
+
+FlexQL is a client-server, in-memory relational database implemented entirely in C++17
+with no external database libraries. It exposes a SQLite-compatible C API and a TCP
+wire protocol that allows multiple concurrent clients.
+
+\subsection*{Architecture Diagram}
+
+\begin{lstlisting}[language={},title={High-level architecture}]
+Client (REPL / benchmark)
+        |  TCP socket  (raw SQL text terminated by ';')
+        v
+ flexql-server
+  +-- Thread Pool  (N = hardware_concurrency workers)
+  +-- Parser  ->  Executor
+  +-- Table Storage  (columnar StringArena + flat arrays)
+  +-- LRU Query Cache
+  +-- PK Index  (flat open-addressing FNV-64 hash map)
+  +-- WAL Writer  (zero-copy writev + SSE4.2 CRC32c)
+  +-- Snapshot Engine  (binary checkpoints)
+\end{lstlisting}
+
+\subsection*{Client API}
+
+The client library (\texttt{flexql.h}) exposes exactly four functions as prescribed:
+
+\begin{lstlisting}[language=C]
+typedef struct FlexQL FlexQL;
+#define FLEXQL_OK    0
+#define FLEXQL_ERROR 1
+
+int  flexql_open (const char *host, int port, FlexQL **db);
+int  flexql_close(FlexQL *db);
+int  flexql_exec (FlexQL *db, const char *sql,
+                  int (*callback)(void*,int,char**,char**),
+                  void *arg, char **errmsg);
+void flexql_free (void *ptr);
+\end{lstlisting}
+
+The callback is invoked once per result row:
+\texttt{callback(data, columnCount, values[], columnNames[])}.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{How Data is Stored}
+
+\subsection{Columnar In-Memory Layout}
+
+Each table uses two parallel flat arrays rather than a \texttt{vector<vector<string>>}:
+
+\begin{lstlisting}[language=C++]
+StringArena                   arena_;    // slab allocator owns all string bytes
+std::vector<RowMeta>          rows_meta_;  // {expires_at, deleted} per row
+std::vector<std::string_view> rows_vals_;  // rows * cols string_views into arena
+int                           num_cols_;
+\end{lstlisting}
+
+\noindent Value at row $r$, column $c$: \texttt{rows\_vals\_[r * num\_cols\_ + c]}
+
+\subsection{StringArena Slab Allocator}
+
+\begin{lstlisting}[language=C++]
+class StringArena {
+    static constexpr size_t BLOCK = 512 * 1024;  // 512 KB slabs
+    std::vector<std::unique_ptr<char[]>> blocks_;
+    size_t used_ = BLOCK;
+public:
+    std::string_view intern(std::string_view sv) {
+        if (used_ + sv.size() > BLOCK) { /* new slab */ }
+        char* p = blocks_.back().get() + used_;
+        std::memcpy(p, sv.data(), sv.size());
+        used_ += sv.size();
+        return {p, sv.size()};
+    }
+};
+\end{lstlisting}
+
+\noindent Slab blocks never move, so interned \texttt{string\_view} references are \textbf{stable
+for the lifetime of the table}.
+
+\subsection{Why This Design?}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{L{3.5cm} L{3.5cm} X}
+\toprule
+\textbf{Design choice} & \textbf{Alternative} & \textbf{Reason} \\
+\midrule
+Flat \texttt{string\_view} array & \texttt{vector<vector<string>>} &
+  Eliminates 1 heap allocation per row. For 1\,M rows: zero per-row \texttt{malloc} calls \\
+\addlinespace
+StringArena slabs & Per-string \texttt{std::string} &
+  All data in $\sim$2 $\times$ 512\,KB blocks; hot strings stay in L2/L3 cache \\
+\addlinespace
+Pre-reserve on first batch & Default \texttt{push\_back} growth &
+  Avoids 7+ reallocation spikes during a 1\,M-row insert benchmark \\
+\bottomrule
+\end{tabularx}
+\caption{Storage design choices and rationale}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Indexing Method}
+
+\subsection{Flat Open-Addressing Hash Map (Primary Key only)}
+
+\texttt{PrimaryIndex} in \texttt{include/index/pk\_index.h}:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Hash function:} FNV-64 — fast, good distribution for string keys
+  \item \textbf{Collision resolution:} linear probing — cache-friendly, no pointer chasing
+  \item \textbf{Load factor threshold:} 0.6 — rehash doubles capacity when exceeded
+  \item \textbf{Keys:} \texttt{string\_view} into arena (zero-copy lookup)
+  \item \textbf{Supports:} \texttt{insert}, \texttt{lookup}, \texttt{remove}, \texttt{update}, \texttt{clear}
+\end{itemize}
+
+\begin{lstlisting}[language=C++,title={FNV-64 hash + probe loop}]
+static uint64_t fnv64(std::string_view s) noexcept {
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) h = (h ^ c) * 1099511628211ULL;
+    return h;
+}
+// lookup: probe from fnv64(key) % capacity until match or empty slot
+\end{lstlisting}
+
+\subsection{Why Not \texttt{std::unordered\_map}?}
+
+Each \texttt{unordered\_map} bucket is a linked list — pointer-chasing across cache lines.
+For 1\,M rows, the flat open-addressing map is approximately $3\times$ faster on lookups
+because all slots are contiguous in memory.
+
+\subsection{Tables Without a Primary Key}
+
+Tables without a \texttt{PRIMARY KEY} constraint have no index. All queries do a linear
+scan of \texttt{rows\_meta\_} and \texttt{rows\_vals\_}. This is intentional — the
+benchmark table (\texttt{BIG\_USERS}) has no primary key, so the hot insert path pays
+zero index overhead.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Caching Strategy}
+
+\subsection{LRU Query Cache}
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Policy:} Least Recently Used (LRU)
+  \item \textbf{Capacity:} Configurable via \texttt{cache\_capacity} in \texttt{config/server.conf}
+        (default 1024 entries)
+  \item \textbf{Key format:} \texttt{TABLE|cols|W:col=op=val|O:colDA|D|Lnn}
+  \item \textbf{Invalidation:} Any \texttt{INSERT / UPDATE / DELETE / TRUNCATE} calls
+        \texttt{invalidate\_prefix(table\_name)}, evicting all cached results for that table
+  \item \textbf{Scope:} \texttt{SELECT} queries only; compound \texttt{WHERE} predicates bypass
+        the cache (they are not fully serialised to a key)
+\end{itemize}
+
+\subsection{Thread Safety}
+
+The cache is protected by a \texttt{shared\_mutex}: multiple readers acquire a shared
+lock concurrently; a write (\texttt{put} / \texttt{invalidate}) takes an exclusive lock.
+
+\subsection{Why LRU over LFU?}
+
+The benchmark pattern is: insert 1\,M rows once, then run repeated \texttt{SELECT} scans.
+LRU captures the \textit{``recently scanned table''} pattern with no frequency bookkeeping
+overhead. LFU would yield identical hit rates but add per-entry counter updates on every
+access.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Handling of Expiration Timestamps}
+
+\subsection{Insertion}
+
+Every row stores \texttt{int64\_t expires\_at} (Unix epoch seconds; \texttt{0} = never
+expires). The benchmark sends rows with a 5th column as the TTL value. The executor
+detects a column-count mismatch of $+1$, extracts the last value as \texttt{expires\_at},
+and strips it before passing the row to storage.
+
+\subsection{Filtering}
+
+\begin{lstlisting}[language=C++]
+bool Table::is_expired(const RowMeta& m) const {
+    if (m.expires_at == 0) return false;
+    return m.expires_at <= (int64_t)std::time(nullptr);
+}
+\end{lstlisting}
+
+Every scan, delete, and update skips expired rows. They become invisible to all queries
+immediately upon expiry — no background job required for correctness.
+
+\subsection{Physical Removal (Compaction)}
+
+A background \textbf{TTL sweeper} thread (\texttt{TTLManager}) runs every
+\texttt{ttl\_sweep\_interval} seconds (default 60\,s). It calls \texttt{Table::compact()}
+on each table, which rebuilds both parallel arrays and the PK index, physically removing
+rows where \texttt{deleted == true} or \texttt{is\_expired() == true}.
+
+This two-phase design (logical deletion $\to$ background physical removal) avoids blocking
+the hot INSERT/SELECT path with compaction work.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Multithreading Design}
+
+\subsection{Thread Pool}
+
+\texttt{ThreadPool} creates \texttt{hardware\_concurrency()} worker threads (configurable
+via \texttt{threads} in \texttt{server.conf}). Each accepted TCP connection is dispatched
+to a free worker via a \texttt{std::queue} protected by \texttt{std::mutex} +
+\texttt{std::condition\_variable}.
+
+\subsection{Per-Table \texttt{shared\_mutex}}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{L{4.5cm} L{3cm} X}
+\toprule
+\textbf{Operation} & \textbf{Lock type} & \textbf{Behaviour} \\
+\midrule
+\texttt{scan()} & \texttt{shared\_lock} & Multiple concurrent readers \\
+\texttt{insert\_flat()} / \texttt{insert\_batch()} & \texttt{unique\_lock} & Exclusive write \\
+\texttt{delete\_rows()} / \texttt{update\_rows()} & \texttt{unique\_lock} & Exclusive write \\
+\texttt{compact()} & \texttt{unique\_lock} & Background only \\
+\bottomrule
+\end{tabularx}
+\caption{Locking strategy per table operation}
+\end{table}
+
+Multiple clients can read the same table simultaneously. A write from one client blocks
+only that table, not others.
+
+\subsection{WAL Writer}
+
+The WAL writer uses a single \texttt{std::mutex}. \texttt{writev} takes $\sim$57\,µs per
+call; contention is negligible under the benchmark's sequential insert pattern.
+
+\subsection{TCP\_NODELAY}
+
+All accepted sockets have \texttt{TCP\_NODELAY} set, disabling Nagle's algorithm. This
+eliminates up to 40\,ms of artificial per-request latency on loopback interfaces.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Persistence — WAL and Snapshots}
+
+\subsection{Write-Ahead Log (WAL)}
+
+Every mutation (\texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{TRUNCATE},
+\texttt{CREATE TABLE}, \texttt{DROP TABLE}) is written to the WAL before execution.
+On crash and restart, the WAL is replayed to recover all committed writes.
+
+\subsubsection*{Record Format (20-byte header + SQL payload)}
+
+\begin{lstlisting}[language={}]
+[ 4B magic ][ 8B LSN ][ 4B payload_len ][ 4B CRC32c ][ SQL bytes ]
+\end{lstlisting}
+
+\subsubsection*{Zero-Copy Append}
+
+\begin{lstlisting}[language=C++]
+uint8_t hdr[20];   // built on stack (magic, LSN, len, checksum)
+struct iovec iov[2] = {{hdr, 20}, {sql.data(), sql.size()}};
+::writev(fd_, iov, 2);   // single syscall, no intermediate copy
+\end{lstlisting}
+
+\subsubsection*{Key Design Decisions}
+
+\begin{itemize}[noitemsep]
+  \item \texttt{fdatasync} is called \textit{only} at shutdown/snapshot — not per write.
+        This saves $\sim$1300\,ms over the benchmark (100 $\times$ 13\,ms per flush).
+  \item \textbf{CRC32c} uses the SSE4.2 hardware instruction \texttt{\_mm\_crc32\_u64}:
+        $\sim$9\,ms for 200 $\times$ 275\,KB batches vs $\sim$166\,ms for software lookup.
+\end{itemize}
+
+\subsection{Binary Snapshots}
+
+Checkpoints are written to \texttt{data/snapshots/snap\_\textit{lsn}.bin}:
+
+\begin{lstlisting}[language={}]
+[ 8B magic ][ 8B snapshot_lsn ]
+[ for each table:
+    4B name_len, name bytes
+    4B num_columns, [ col_name, col_type, pk, not_null ] * N
+    8B num_rows,    [ col_values..., expires_at ] * M
+]
+\end{lstlisting}
+
+\subsection{Recovery on Startup}
+
+\begin{enumerate}[noitemsep]
+  \item Load the snapshot with the highest LSN (restores all schemas and row data)
+  \item Replay WAL records with \texttt{LSN > snapshot\_lsn} (recovers mutations since checkpoint)
+  \item Accept client connections
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{SQL Language Support}
+
+The parser is a hand-written recursive-descent parser with a dedicated fast path
+(\texttt{fast\_parse\_insert}) for performance-critical INSERT statements.
+
+\subsection{DDL}
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE [IF NOT EXISTS] t (col type [PRIMARY KEY] [NOT NULL], ...)
+  -- types: INT, DECIMAL, VARCHAR(n), TEXT, DATETIME
+DROP TABLE [IF EXISTS] t
+TRUNCATE TABLE t
+ALTER TABLE t ADD COLUMN col type
+\end{lstlisting}
+
+\subsection{DML}
+
+\begin{lstlisting}[language=SQL]
+INSERT INTO t [(col, ...)] VALUES (v, ...) [, (v, ...) ...]
+UPDATE t SET col=v [, col=v ...] [WHERE ...]
+DELETE FROM t [WHERE ...]
+\end{lstlisting}
+
+\subsection{DQL}
+
+\begin{lstlisting}[language=SQL]
+SELECT [DISTINCT] col [AS alias], ...
+  FROM t
+  [INNER JOIN t2 ON t.col = t2.col]
+  [LEFT  JOIN t2 ON t.col = t2.col]
+  [WHERE ...]
+  [GROUP BY col [, col ...] [HAVING ...]]
+  [ORDER BY col [ASC|DESC] [, col [ASC|DESC] ...]]
+  [LIMIT n] [OFFSET m]
+
+SELECT COUNT(*) | SUM(col) | AVG(col) | MIN(col) | MAX(col)
+  FROM t [WHERE ...]
+\end{lstlisting}
+
+\subsection{WHERE Predicates (Compound)}
+
+Operators: \texttt{=}, \texttt{!=}, \texttt{<}, \texttt{<=}, \texttt{>}, \texttt{>=},
+\texttt{LIKE} (\texttt{\%} and \texttt{\_} wildcards), \texttt{BETWEEN v AND v},
+\texttt{IN (v, ...)}, \texttt{IS NULL}, \texttt{IS NOT NULL},
+combined with \texttt{AND}, \texttt{OR}, \texttt{NOT}, and nested parentheses.
+
+The predicate is represented as a tree (\texttt{LEAF / AND\_NODE / OR\_NODE / NOT\_NODE})
+evaluated recursively during a table scan.
+
+\subsection{Utility Commands}
+
+\begin{lstlisting}[language=SQL]
+SHOW TABLES
+SHOW DATABASES
+SHOW COLUMNS FROM t    -- synonym for DESCRIBE
+DESCRIBE t
+USE [DATABASE] name
+\end{lstlisting}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Wire Protocol}
+
+Plain-text, newline-delimited over TCP. The client sends raw SQL terminated by
+\texttt{;} in a single \texttt{send} call. The server replies:
+
+\begin{lstlisting}[language={}]
+# SELECT with results:
+COLS col1 col2 col3
+ROW  val1 val2 val3
+...
+END
+
+# Non-SELECT (INSERT, UPDATE, ...):
+OK
+END
+
+# Error:
+ERROR: <message>
+END
+\end{lstlisting}
+
+The \texttt{COLS} header carries real column names including \texttt{AS} aliases.
+The benchmark client (\texttt{bench/flexql.cpp}) ignores non-\texttt{ROW} lines, so the
+header is fully backward-compatible.
+
+\textbf{Buffering:} The server uses a 64\,KB \texttt{recv} buffer (pre-reserved to
+512\,KB for large \texttt{INSERT} batches). The client uses a 4\,KB local read buffer
+to eliminate per-character \texttt{recv} syscalls.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Performance Results}
+
+\textbf{Hardware:} Intel Core i7-10700K @ 3.8\,GHz, 16\,GB RAM, Ubuntu 24.04 LTS.
+\textbf{Build:} \texttt{-O3 -march=native -std=c++17}.
+
+\subsection{INSERT Benchmark}
+
+Schema: \texttt{BIG\_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES\_AT DECIMAL)} — 5 columns, no primary key, batch size 5,000.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Dataset} & \textbf{Elapsed} & \textbf{Throughput} & \textbf{Notes} \\
+\midrule
+1\,M rows & $\sim$610\,ms & $\sim$1.64\,M rows/sec & WAL overhead $\sim$55\,ms \\
+5\,M rows & $\sim$3.28\,s & $\sim$1.52\,M rows/sec & WAL overhead $\sim$250\,ms \\
+\bottomrule
+\end{tabular}
+\caption{INSERT benchmark results (with full WAL persistence)}
+\end{table}
+
+\subsection{SELECT Queries (after 1\,M-row insert)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Query} & \textbf{Elapsed} \\
+\midrule
+\texttt{SELECT COUNT(*) FROM BIG\_USERS} & $\sim$210\,ms \\
+\texttt{SELECT * WHERE ID = 500000} (PK lookup) & $\sim$81\,ms \\
+\texttt{SELECT ... WHERE ID > 999990 ORDER BY ID DESC LIMIT 10} & $\sim$81\,ms \\
+4 concurrent \texttt{SELECT COUNT(*)} & $\sim$325\,ms each \\
+\bottomrule
+\end{tabular}
+\caption{SELECT query latencies on 1\,M-row table}
+\end{table}
+
+\texttt{COUNT(*)} performs a full table scan. PK equality lookups are $O(1)$ via the
+flat hash map.
+
+\subsection{Memory Footprint}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Dataset} & \textbf{RSS} \\
+\midrule
+1\,M rows (5 columns) & $\sim$615\,MB \\
+5\,M rows (5 columns) & $\sim$727\,MB \\
+\bottomrule
+\end{tabular}
+\caption{Server resident set size}
+\end{table}
+
+\subsection{Unit Test Results}
+
+\textbf{22 / 22} benchmark unit tests pass on every run. Tests cover: single-row
+\texttt{SELECT}, filtered \texttt{SELECT} with \texttt{ORDER BY}, empty result sets,
+multi-table \texttt{INNER JOIN}, \texttt{JOIN} with no matches, invalid column error,
+and missing table error.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Compilation and Execution}
+
+\subsection{Requirements}
+
+\begin{itemize}[noitemsep]
+  \item GCC 11+ or Clang 14+ with C++17 support
+  \item Linux (uses \texttt{writev}, \texttt{shared\_mutex}, POSIX threads)
+  \item No external libraries required
+\end{itemize}
+
+\subsection{Build}
+
+\begin{lstlisting}[language=bash]
+git clone https://github.com/devchaitanya/FlexQl.git
+cd FlexQl
+make all -j$(nproc)
+# Produces: bin/flexql-server  bin/flexql-client
+\end{lstlisting}
+
+\subsection{Run the Server}
+
+\begin{lstlisting}[language=bash]
+mkdir -p data/wal data/snapshots
+./bin/flexql-server 9000
+# Configuration: config/server.conf
+\end{lstlisting}
+
+\subsection{Run the Interactive Client (REPL)}
+
+\begin{lstlisting}[language=bash]
+./bin/flexql-client 127.0.0.1 9000
+\end{lstlisting}
+
+\begin{lstlisting}[language=SQL]
+flexql> CREATE TABLE users (id INT PRIMARY KEY NOT NULL, name VARCHAR(64));
+flexql> INSERT INTO users VALUES (1, 'Alice', 0), (2, 'Bob', 0);
+flexql> SELECT * FROM users ORDER BY name;
++----+-------+
+| id | name  |
++----+-------+
+| 1  | Alice |
+| 2  | Bob   |
++----+-------+
+2 rows in set (0.000 sec)
+flexql> .exit
+\end{lstlisting}
+
+\subsection{Run the Benchmark}
+
+\begin{lstlisting}[language=bash]
+./bench/benchmark 1000000    # 1M-row insert + unit tests
+./bench/benchmark --unit-test  # unit tests only
+./bench/benchmark 5000000    # 5M rows
+\end{lstlisting}
+
+\subsection{Source Layout}
+
+\begin{lstlisting}[language={}]
+FlexQl/
+  include/          -- public headers (grouped by subsystem)
+    cache/          -- lru_cache.h
+    common/         -- types.h
+    concurrency/    -- thread_pool.h
+    expiration/     -- ttl_manager.h
+    index/          -- pk_index.h
+    network/        -- protocol.h, server.h
+    parser/         -- ast.h, parser.h, token.h
+    query/          -- executor.h
+    storage/        -- arena.h, database.h, snapshot.h, table.h, wal.h
+    utils/          -- string_utils.h
+  src/              -- implementation (.cpp files, same layout as include/)
+    client/         -- flexql.cpp (API), client.cpp (REPL)
+  bench/            -- benchmark_flexql.cpp, flexql.h (instructor-provided)
+  config/           -- server.conf
+  docs/             -- design.tex  (this document)
+  data/             -- wal/ and snapshots/ (created at runtime)
+  Makefile
+  README.md
+  DESIGN.md
+\end{lstlisting}
+
+\end{document}

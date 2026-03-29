@@ -1,0 +1,4 @@
+CompileFlags:
+  CompilationDatabase: .
+  Remove:
+    - "-march=native"   # clangd may not support host-specific tuning flags
