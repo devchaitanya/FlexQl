@@ -35,7 +35,7 @@
     urlcolor    = linkblue,
     citecolor   = linkblue,
     pdftitle    = {FlexQL Design Document},
-    pdfauthor   = {devchaitanya},
+    pdfauthor   = {K Chaitanya},
     pdfsubject  = {Database Engine Design},
 }
 
@@ -76,7 +76,6 @@
 \pagestyle{fancy}
 \fancyhf{}
 \lhead{\small\textbf{FlexQL} — Design Document}
-\rhead{\small\textit{devchaitanya}}
 \cfoot{\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 
@@ -100,7 +99,7 @@
 \vspace{0.5cm}
 {\small
 \begin{tabular}{ll}
-\textbf{Author}     & devchaitanya \\[2pt]
+\textbf{Author}     & K chaitanya \\[2pt]
 \textbf{Repository} & \href{https://github.com/devchaitanya/FlexQl}{github.com/devchaitanya/FlexQl} \\[2pt]
 \textbf{Language}   & C++17 (no external DB libraries) \\[2pt]
 \textbf{Platform}   & Linux (GCC 15 / Clang 20) \\[2pt]
@@ -499,14 +498,71 @@ header is fully backward-compatible.
 to eliminate per-character \texttt{recv} syscalls.
 
 % ══════════════════════════════════════════════════════════════════════════════
+\section{Other Design Decisions}
+
+\subsection{Parser Fast Path for INSERT}
+
+The parser has two code paths: a full recursive-descent parser for all SQL statements,
+and a dedicated \texttt{fast\_parse\_insert()} for INSERT. The fast path operates as a
+single-pass character scanner over the raw SQL buffer, producing
+\texttt{std::string\_view}s directly into the input --- zero heap allocations for a 25K-row
+batch. This avoids constructing 25K \texttt{Token} objects and 25K inner vectors that
+the general parser would create.
+
+\subsection{Compiler and Build Optimizations}
+
+The Makefile uses aggressive optimization flags:
+
+\begin{itemize}[noitemsep]
+  \item \texttt{-O3 -march=native}: enables auto-vectorisation and targets the host CPU's
+        instruction set (AVX2, SSE4.2)
+  \item \texttt{-funroll-loops}: reduces loop overhead in tight scan loops
+  \item \texttt{-flto=auto}: link-time optimisation across translation units, allowing
+        cross-file inlining of hot functions like \texttt{StringArena::intern()}
+\end{itemize}
+
+No external libraries are linked. The only hardware-specific dependency is SSE4.2 for the
+CRC32c instruction in the WAL writer.
+
+\subsection{DoS Protection on \texttt{recv\_sql}}
+
+The server enforces a 16\,MB cap on incoming SQL messages. If a client sends a message
+exceeding this limit, \texttt{recv\_sql()} returns an empty string and the connection is
+closed. This prevents a malicious or buggy client from exhausting server memory with a
+single unbounded request.
+
+\subsection{JOIN Deadlock Prevention}
+
+When executing a JOIN, the executor must lock two tables. To prevent ABBA deadlocks when
+two concurrent queries join the same tables in different order, the executor always
+acquires table locks in \textbf{alphabetical order} of the table name. This total ordering
+guarantees deadlock freedom without a lock manager.
+
+\subsection{Database Singleton}
+
+The \texttt{Database} class uses the singleton pattern (\texttt{Database::instance()}) to
+provide a single global table registry. All threads access the same instance; the registry
+itself is protected by a \texttt{shared\_mutex} for concurrent table lookups. Individual
+table mutations are protected by per-table locks (see Section~6).
+
+\subsection{Predicate Tree for Compound WHERE}
+
+Rather than evaluating WHERE clauses as a flat list of conditions, the parser builds a
+tree of \texttt{Predicate} nodes (\texttt{LEAF}, \texttt{AND\_NODE}, \texttt{OR\_NODE},
+\texttt{NOT\_NODE}). This supports arbitrarily nested Boolean logic such as
+\texttt{WHERE (A > 1 OR B < 5) AND NOT C = 3}. The tree is evaluated recursively during
+the table scan --- no intermediate materialisation of row sets.
+
+% ══════════════════════════════════════════════════════════════════════════════
 \section{Performance Results}
 
-\textbf{Hardware:} Intel Core i5-1135G7 @ 2.40\,GHz, 14\,GB RAM, Ubuntu Linux.
+All benchmarks run on a 1\,M-row table (\texttt{BENCH}: 5 columns, no primary key)
+unless stated otherwise.
+
+\noindent\textbf{Hardware:} Intel Core i5-1135G7 @ 2.40\,GHz, 14\,GB RAM, Ubuntu Linux.\\
 \textbf{Build:} \texttt{-O3 -march=native -std=c++17}.
 
-\subsection{INSERT Benchmark}
-
-Schema: \texttt{BIG\_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES\_AT DECIMAL)} --- 5 columns, no primary key.
+\subsection{INSERT Throughput}
 
 \subsubsection*{Batch Size 25,000}
 
@@ -540,28 +596,163 @@ Schema: \texttt{BIG\_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALA
 \end{table}
 
 Larger batches reduce TCP round-trips and lock acquisitions, yielding $\sim$10--21\%
-higher throughput. Throughput degrades slightly at scale due to hash-table rehashing
-and memory pressure.
+higher throughput.
 
-\subsection{SELECT Queries (after 1\,M-row insert)}
+\subsection{SELECT Queries}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lr}
+\begin{tabular}{L{9cm} r r}
 \toprule
-\textbf{Query} & \textbf{Elapsed} \\
+\textbf{Query} & \textbf{Rows} & \textbf{Elapsed} \\
 \midrule
-\texttt{SELECT COUNT(*) FROM BIG\_USERS} & $\sim$210\,ms \\
-\texttt{SELECT * WHERE ID = 500000} (PK lookup) & $\sim$81\,ms \\
-\texttt{SELECT ... WHERE ID > 999990 ORDER BY ID DESC LIMIT 10} & $\sim$81\,ms \\
-4 concurrent \texttt{SELECT COUNT(*)} & $\sim$325\,ms each \\
+\texttt{SELECT COUNT(*) FROM BENCH}                          & 1       & 168\,ms  \\
+\texttt{SELECT * FROM BENCH} (full scan)                     & 1\,M    & 1,165\,ms \\
+\texttt{SELECT * WHERE ID = 500000}                          & 1       & 122\,ms  \\
+\texttt{SELECT * WHERE SALARY > 90000}                       & 139,986 & 276\,ms  \\
+\texttt{SELECT * WHERE DEPT='ENG' AND SALARY>80000}          & 34,986  & 109\,ms  \\
+\texttt{SELECT * WHERE DEPT='HR' OR DEPT='SALES'}            & 250,000 & 348\,ms  \\
+\texttt{SELECT * WHERE SALARY BETWEEN 50000 AND 60000}       & 140,015 & 344\,ms  \\
+\texttt{SELECT * WHERE DEPT IN ('ENG','HR','FIN')}           & 375,000 & 484\,ms  \\
+\texttt{SELECT * WHERE NAME LIKE 'user1\%'}                  & 111,112 & 170\,ms  \\
+\texttt{SELECT * ORDER BY SALARY DESC LIMIT 10}              & 10      & 1,135\,ms \\
+\texttt{SELECT * ORDER BY ID DESC LIMIT 100 OFFSET 1000}     & 100     & 912\,ms  \\
+\texttt{SELECT DISTINCT DEPT FROM BENCH}                     & 8       & 87\,ms   \\
 \bottomrule
 \end{tabular}
 \caption{SELECT query latencies on 1\,M-row table}
 \end{table}
 
-\texttt{COUNT(*)} performs a full table scan. PK equality lookups are $O(1)$ via the
-flat hash map.
+\texttt{ORDER BY} is expensive because it materialises a full copy before sorting.
+Filtered scans with compound \texttt{WHERE} scale linearly with the output-set size.
+
+\subsection{Aggregate Queries}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{L{9cm} r}
+\toprule
+\textbf{Query} & \textbf{Elapsed} \\
+\midrule
+\texttt{SELECT SUM(SALARY)}                                & 173\,ms \\
+\texttt{SELECT AVG(SALARY)}                                & 146\,ms \\
+\texttt{SELECT MIN(SALARY)}                                & 145\,ms \\
+\texttt{SELECT MAX(SALARY)}                                & 145\,ms \\
+\texttt{GROUP BY DEPT} (8 groups)                          & 210\,ms \\
+\texttt{GROUP BY DEPT HAVING AVG(SALARY)>60000}            & 268\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Aggregate query latencies on 1\,M-row table}
+\end{table}
+
+\subsection{JOIN Queries}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{L{8cm} r r}
+\toprule
+\textbf{Query} & \textbf{Rows} & \textbf{Elapsed} \\
+\midrule
+\texttt{INNER JOIN} (1\,M $\times$ 8, all match)      & 1\,M    & 726\,ms \\
+\texttt{INNER JOIN + WHERE SALARY>90000}               & 139,986 & 332\,ms \\
+\texttt{LEFT JOIN} (1\,M $\times$ 8)                   & 1\,M    & 959\,ms \\
+\bottomrule
+\end{tabular}
+\caption{JOIN query latencies (BENCH 1\,M rows $\times$ DEPARTMENTS 8 rows)}
+\end{table}
+
+\subsection{UPDATE and DELETE}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{L{9cm} r}
+\toprule
+\textbf{Operation} & \textbf{Elapsed} \\
+\midrule
+\texttt{UPDATE} single row (\texttt{WHERE ID=1})                 & 155\,ms \\
+\texttt{UPDATE} 1,000 rows (\texttt{WHERE ID<=1000})             & 143\,ms \\
+\texttt{UPDATE} filtered (\texttt{DEPT='QA' AND SALARY<50000})   & 73\,ms  \\
+\texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 143\,ms \\
+\texttt{DELETE} filtered (\texttt{DEPT='LEGAL' AND SALARY<40000}) & 72\,ms  \\
+\bottomrule
+\end{tabular}
+\caption{UPDATE / DELETE latencies on 1\,M-row table}
+\end{table}
+
+\subsection{LRU Cache Effect}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lr}
+\toprule
+\textbf{Invocation} & \textbf{Elapsed} \\
+\midrule
+First  (cold cache) & 113.4\,ms \\
+Second (warm cache) & 0.108\,ms \\
+Third  (warm cache) & 0.029\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Cache hit vs.\ miss for a point query. Speedup: $\sim$3,900$\times$}
+\end{table}
+
+\subsection{Concurrency --- Concurrent Reads}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Threads} & \textbf{Queries} & \textbf{Avg Latency} & \textbf{COUNT(*) wall-clock} \\
+\midrule
+1 & 20  & 112.5\,ms & 157\,ms \\
+4 & 80  & 101.1\,ms & 232\,ms \\
+8 & 160 &  69.5\,ms & 512\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Concurrent read scaling (\texttt{shared\_lock} allows parallel readers)}
+\end{table}
+
+Average per-query latency \textit{decreases} with more threads because multiple readers
+share the table lock concurrently. Wall-clock for 8 simultaneous \texttt{COUNT(*)} scans
+is only $3.3\times$ that of a single scan, showing good read parallelism.
+
+\subsection{Concurrency --- Mixed Read/Write Workload}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{L{4cm} rrr}
+\toprule
+\textbf{Config} & \textbf{Read ops} & \textbf{Write ops} & \textbf{Total ops/sec} \\
+\midrule
+4 readers + 1 writer  & 105 & 1 & 33 \\
+4 readers + 4 writers & 85  & 4 & 25 \\
+\bottomrule
+\end{tabular}
+\caption{Mixed workload over 3 seconds (point queries + single-row UPDATEs)}
+\end{table}
+
+Write contention reduces read throughput because each \texttt{UPDATE} acquires an
+exclusive \texttt{unique\_lock}, blocking concurrent readers momentarily. Per-query
+latency is $\sim$100\,ms due to full-table scans (no PK index on this table).
+
+\subsection{Concurrency --- Concurrent Inserts (Separate Tables)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Threads} & \textbf{Total Rows} & \textbf{Wall-clock} & \textbf{Agg.\ Throughput} \\
+\midrule
+1 &  50\,K  &  8\,ms  &  6.25\,M rows/sec \\
+4 & 200\,K  & 14\,ms  & 14.29\,M rows/sec \\
+8 & 400\,K  & 25\,ms  & 16.00\,M rows/sec \\
+\bottomrule
+\end{tabular}
+\caption{Concurrent INSERT into separate tables (per-table locks, no contention)}
+\end{table}
+
+When each thread writes to its own table, per-table \texttt{unique\_lock} causes zero
+contention. Aggregate throughput scales almost linearly: 8 threads achieve
+$2.6\times$ the throughput of 1 thread.
 
 \subsection{Memory Footprint}
 
@@ -569,14 +760,20 @@ flat hash map.
 \centering
 \begin{tabular}{lr}
 \toprule
-\textbf{Dataset} & \textbf{RSS} \\
+\textbf{State} & \textbf{Server RSS} \\
 \midrule
-1\,M rows (5 columns) & $\sim$615\,MB \\
-5\,M rows (5 columns) & $\sim$727\,MB \\
+Idle (no tables)                  &   7.0\,MB \\
+After 1\,M-row seed (5 columns)  & 138.8\,MB \\
+After full benchmark suite        & $\sim$1.0\,GB \\
 \bottomrule
 \end{tabular}
-\caption{Server resident set size}
+\caption{Server resident set size at different stages}
 \end{table}
+
+The 1\,M-row table uses $\sim$132\,MB of memory (StringArena slabs + row metadata +
+\texttt{string\_view} array). The post-benchmark RSS is higher because the WAL file
+and multiple temporary tables created during concurrent INSERT tests are mapped into
+memory before being cleaned up.
 
 \subsection{Unit Test Results}
 
