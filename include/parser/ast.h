@@ -7,9 +7,9 @@
 #include <variant>
 #include <memory>
 
-// ── Compound predicate tree ────────────────────────────────────────────────────
-// Replaces the single-condition WhereClause for WHERE clauses, enabling
-// AND / OR / NOT / BETWEEN / IN / IS NULL.
+// ── Predicate node ─────────────────────────────────────────────────────────────
+// WHERE clauses use LEAF nodes only (single condition).
+// AND/OR/NOT nodes are retained for internal HAVING clause support.
 
 struct Predicate {
     enum Kind { LEAF, AND_NODE, OR_NODE, NOT_NODE } kind = LEAF;

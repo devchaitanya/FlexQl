@@ -133,16 +133,6 @@ static void bench_selects(FlexQL *db) {
     us = timed_count(db, "SELECT * FROM BENCH WHERE SALARY > 90000;", rows);
     print_result("SELECT * WHERE SALARY > 90000", us, rows);
 
-    // Filtered scan - compound AND
-    us = timed_count(db,
-        "SELECT * FROM BENCH WHERE DEPT = 'ENG' AND SALARY > 80000;", rows);
-    print_result("SELECT * WHERE DEPT='ENG' AND SALARY>80000", us, rows);
-
-    // Filtered scan - compound OR
-    us = timed_count(db,
-        "SELECT * FROM BENCH WHERE DEPT = 'HR' OR DEPT = 'SALES';", rows);
-    print_result("SELECT * WHERE DEPT='HR' OR DEPT='SALES'", us, rows);
-
     // BETWEEN
     us = timed_count(db,
         "SELECT * FROM BENCH WHERE SALARY BETWEEN 50000 AND 60000;", rows);
@@ -260,8 +250,8 @@ static void bench_updates(FlexQL *db) {
 
     // Update by department (filtered)
     us = timed_exec(db,
-        "UPDATE BENCH SET SALARY = 75000 WHERE DEPT = 'QA' AND SALARY < 50000;");
-    print_result("UPDATE filtered (DEPT='QA' AND SALARY<50000)", us);
+        "UPDATE BENCH SET SALARY = 75000 WHERE DEPT = 'QA';");
+    print_result("UPDATE filtered (WHERE DEPT='QA')", us);
 
     cout << "\n";
 }
@@ -276,8 +266,8 @@ static void bench_deletes(FlexQL *db) {
     print_result("DELETE 100 rows (WHERE ID<=100)", us);
 
     // Delete by filter
-    us = timed_exec(db, "DELETE FROM BENCH WHERE DEPT = 'LEGAL' AND SALARY < 40000;");
-    print_result("DELETE filtered (DEPT='LEGAL' AND SALARY<40000)", us);
+    us = timed_exec(db, "DELETE FROM BENCH WHERE DEPT = 'LEGAL';");
+    print_result("DELETE filtered (WHERE DEPT='LEGAL')", us);
 
     // Verify remaining
     long long rows;

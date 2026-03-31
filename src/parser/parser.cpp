@@ -299,18 +299,21 @@ InsertStmt Parser::parse_insert() {
     return stmt;
 }
 
-// ── Compound WHERE predicate parsing ─────────────────────────────────────────
-// Grammar (precedence low→high):
-//   pred_or  ::= pred_and ( OR pred_and )*
-//   pred_and ::= pred_not ( AND pred_not )*
-//   pred_not ::= NOT pred_not | pred_atom
-//   pred_atom::= col op val | col IS [NOT] NULL | col BETWEEN v AND v
-//              | col [NOT] IN ( v, ... ) | col LIKE pat | ( pred_or )
+// ── WHERE predicate parsing ──────────────────────────────────────────────────
+// Assignment constraint: only a single condition is allowed in WHERE.
+// Logical combinations (AND, OR, NOT) are rejected.
+// Supported: col op val, BETWEEN, IN, LIKE, IS [NOT] NULL.
 
 std::unique_ptr<Predicate> Parser::try_parse_where() {
     if (!check(TokenType::KW_WHERE)) return nullptr;
     advance(); // consume WHERE
-    return parse_pred_or();
+    auto pred = parse_pred_atom();
+    // Reject compound logic — assignment forbids AND/OR in WHERE
+    if (check(TokenType::KW_AND))
+        throw ParseError("compound WHERE with AND is not supported (only single conditions allowed)");
+    if (check(TokenType::KW_OR))
+        throw ParseError("compound WHERE with OR is not supported (only single conditions allowed)");
+    return pred;
 }
 
 std::unique_ptr<Predicate> Parser::parse_pred_or() {
@@ -342,26 +345,12 @@ std::unique_ptr<Predicate> Parser::parse_pred_and() {
 }
 
 std::unique_ptr<Predicate> Parser::parse_pred_not() {
-    if (check(TokenType::KW_NOT)) {
-        advance();
-        auto child = parse_pred_not();
-        auto node = std::make_unique<Predicate>();
-        node->kind = Predicate::NOT_NODE;
-        node->children.push_back(std::move(child));
-        return node;
-    }
+    // Standalone NOT as a logical combinator is not supported in WHERE
+    // (NOT BETWEEN and NOT IN are handled inside parse_pred_atom)
     return parse_pred_atom();
 }
 
 std::unique_ptr<Predicate> Parser::parse_pred_atom() {
-    // Parenthesised sub-expression
-    if (check(TokenType::LPAREN)) {
-        advance();
-        auto inner = parse_pred_or();
-        expect(TokenType::RPAREN, ")");
-        return inner;
-    }
-
     // FUNC(arg) expression used in HAVING — treat as a column name "FUNC(ARG)"
     std::string col;
     if (check(TokenType::IDENTIFIER) &&

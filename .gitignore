@@ -40,3 +40,5 @@ docs/*.pdf
 *.swp
 *.swo
 *~
+FlexQl.pdf
+bench/benchmark_full

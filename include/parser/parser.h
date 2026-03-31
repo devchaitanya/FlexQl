@@ -31,12 +31,12 @@ private:
     UseDatabaseStmt  parse_use();
     AlterTableStmt   parse_alter();
 
-    // WHERE: returns a predicate tree supporting AND/OR/NOT/BETWEEN/IN/IS NULL.
+    // WHERE: returns a single-condition predicate (no AND/OR/NOT).
     // Returns nullptr if no WHERE keyword is present.
-    std::unique_ptr<Predicate> try_parse_where();    // peeks for KW_WHERE, returns nullptr if absent
-    std::unique_ptr<Predicate> parse_pred_or();      // lowest precedence: OR
-    std::unique_ptr<Predicate> parse_pred_and();     // AND
-    std::unique_ptr<Predicate> parse_pred_not();     // NOT (unary)
+    std::unique_ptr<Predicate> try_parse_where();
+    std::unique_ptr<Predicate> parse_pred_or();      // used by HAVING only
+    std::unique_ptr<Predicate> parse_pred_and();     // used by HAVING only
+    std::unique_ptr<Predicate> parse_pred_not();     // used by HAVING only
     std::unique_ptr<Predicate> parse_pred_atom();    // leaf comparison
 
     std::vector<OrderByClause> parse_order_by();

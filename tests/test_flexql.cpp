@@ -175,13 +175,33 @@ static void test_parser_select_join() {
 }
 
 static void test_parser_select_compound_where() {
-    SECTION("Parser: compound WHERE (AND/OR/NOT)");
-    auto stmt = Parser::parse(
-        "SELECT * FROM t WHERE a > 1 AND (b = 'x' OR c < 10);");
-    auto* ss = std::get_if<SelectStmt>(&stmt);
-    CHECK(ss != nullptr, "parses");
-    if (ss && ss->where) {
-        CHECK(ss->where->kind == Predicate::AND_NODE, "root is AND");
+    SECTION("Parser: compound WHERE (AND/OR) must be rejected");
+    // AND must be rejected
+    {
+        bool threw = false;
+        try {
+            Parser::parse("SELECT * FROM t WHERE a > 1 AND b = 'x';");
+        } catch (const ParseError&) { threw = true; }
+        CHECK(threw, "AND in WHERE throws ParseError");
+    }
+    // OR must be rejected
+    {
+        bool threw = false;
+        try {
+            Parser::parse("SELECT * FROM t WHERE a > 1 OR b = 'x';");
+        } catch (const ParseError&) { threw = true; }
+        CHECK(threw, "OR in WHERE throws ParseError");
+    }
+    // Single condition must still work
+    {
+        auto stmt = Parser::parse("SELECT * FROM t WHERE a > 1;");
+        auto* ss = std::get_if<SelectStmt>(&stmt);
+        CHECK(ss && ss->where, "single WHERE still works");
+        if (ss && ss->where) {
+            CHECK(ss->where->kind == Predicate::LEAF, "single LEAF predicate");
+            CHECK_STR_EQ(ss->where->col, std::string("A"), "col = A");
+            CHECK_STR_EQ(ss->where->op, std::string(">"), "op = >");
+        }
     }
 }
 

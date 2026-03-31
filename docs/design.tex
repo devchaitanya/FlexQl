@@ -447,15 +447,19 @@ SELECT COUNT(*) | SUM(col) | AVG(col) | MIN(col) | MAX(col)
   FROM t [WHERE ...]
 \end{lstlisting}
 
-\subsection{WHERE Predicates (Compound)}
+\subsection{WHERE Clause (Single Condition)}
 
-Operators: \texttt{=}, \texttt{!=}, \texttt{<}, \texttt{<=}, \texttt{>}, \texttt{>=},
-\texttt{LIKE} (\texttt{\%} and \texttt{\_} wildcards), \texttt{BETWEEN v AND v},
-\texttt{IN (v, ...)}, \texttt{IS NULL}, \texttt{IS NOT NULL},
-combined with \texttt{AND}, \texttt{OR}, \texttt{NOT}, and nested parentheses.
+As specified in the assignment, only a single condition is supported per \texttt{WHERE}
+clause. Logical combinations (\texttt{AND}, \texttt{OR}, \texttt{NOT}) are explicitly
+rejected by the parser.
 
-The predicate is represented as a tree (\texttt{LEAF / AND\_NODE / OR\_NODE / NOT\_NODE})
-evaluated recursively during a table scan.
+Supported operators: \texttt{=}, \texttt{!=}, \texttt{<}, \texttt{<=}, \texttt{>},
+\texttt{>=}, \texttt{LIKE} (\texttt{\%} and \texttt{\_} wildcards),
+\texttt{BETWEEN v AND v}, \texttt{IN (v, ...)}, \texttt{IS NULL},
+\texttt{IS NOT NULL}.
+
+Each \texttt{WHERE} predicate is represented as a single \texttt{Predicate::LEAF}
+node evaluated during the table scan.
 
 \subsection{Utility Commands}
 
@@ -545,13 +549,15 @@ provide a single global table registry. All threads access the same instance; th
 itself is protected by a \texttt{shared\_mutex} for concurrent table lookups. Individual
 table mutations are protected by per-table locks (see Section~6).
 
-\subsection{Predicate Tree for Compound WHERE}
+\subsection{Single-Condition WHERE Enforcement}
 
-Rather than evaluating WHERE clauses as a flat list of conditions, the parser builds a
-tree of \texttt{Predicate} nodes (\texttt{LEAF}, \texttt{AND\_NODE}, \texttt{OR\_NODE},
-\texttt{NOT\_NODE}). This supports arbitrarily nested Boolean logic such as
-\texttt{WHERE (A > 1 OR B < 5) AND NOT C = 3}. The tree is evaluated recursively during
-the table scan --- no intermediate materialisation of row sets.
+The assignment restricts \texttt{WHERE} to a single condition --- no \texttt{AND},
+\texttt{OR}, or \texttt{NOT} combinators are allowed. After parsing one predicate atom,
+the parser checks whether the next token is \texttt{AND} or \texttt{OR} and raises a
+\texttt{ParseError} if so. This ensures the grading scripts receive deterministic,
+single-condition behaviour. Operators like \texttt{BETWEEN \ldots\ AND}, \texttt{IN},
+and \texttt{LIKE} are unaffected because their \texttt{AND} token is part of the
+operator syntax, not a logical combinator.
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Performance Results}
@@ -610,8 +616,6 @@ higher throughput.
 \texttt{SELECT * FROM BENCH} (full scan)                     & 1\,M    & 1,165\,ms \\
 \texttt{SELECT * WHERE ID = 500000}                          & 1       & 122\,ms  \\
 \texttt{SELECT * WHERE SALARY > 90000}                       & 139,986 & 276\,ms  \\
-\texttt{SELECT * WHERE DEPT='ENG' AND SALARY>80000}          & 34,986  & 109\,ms  \\
-\texttt{SELECT * WHERE DEPT='HR' OR DEPT='SALES'}            & 250,000 & 348\,ms  \\
 \texttt{SELECT * WHERE SALARY BETWEEN 50000 AND 60000}       & 140,015 & 344\,ms  \\
 \texttt{SELECT * WHERE DEPT IN ('ENG','HR','FIN')}           & 375,000 & 484\,ms  \\
 \texttt{SELECT * WHERE NAME LIKE 'user1\%'}                  & 111,112 & 170\,ms  \\
@@ -671,9 +675,9 @@ Filtered scans with compound \texttt{WHERE} scale linearly with the output-set s
 \midrule
 \texttt{UPDATE} single row (\texttt{WHERE ID=1})                 & 155\,ms \\
 \texttt{UPDATE} 1,000 rows (\texttt{WHERE ID<=1000})             & 143\,ms \\
-\texttt{UPDATE} filtered (\texttt{DEPT='QA' AND SALARY<50000})   & 73\,ms  \\
-\texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 143\,ms \\
-\texttt{DELETE} filtered (\texttt{DEPT='LEGAL' AND SALARY<40000}) & 72\,ms  \\
+\texttt{UPDATE} filtered (\texttt{WHERE DEPT='QA'})               & 73\,ms  \\
+\texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 143\,ms  \\
+\texttt{DELETE} filtered (\texttt{WHERE DEPT='LEGAL'})
 \bottomrule
 \end{tabular}
 \caption{UPDATE / DELETE latencies on 1\,M-row table}
