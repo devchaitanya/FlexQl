@@ -82,6 +82,49 @@ bool send_response(int fd, const std::string& resp) {
     return send_all(fd, resp);
 }
 
+bool stream_response(int fd, const QueryResult& res) {
+    if (!res.ok)
+        return send_all(fd, "ERROR: " + res.error + "\nEND\n");
+
+    if (res.column_names.empty())
+        return send_all(fd, "OK\nEND\n");
+
+    const int ncols = (int)res.column_names.size();
+    std::string buf;
+    buf.reserve(256 * 1024); // 256 KB buffer
+
+    // COLS header
+    buf = "COLS";
+    for (const auto& col : res.column_names) { buf += ' '; buf += col; }
+    buf += '\n';
+
+    static constexpr size_t FLUSH_THRESHOLD = 200 * 1024; // flush every ~200 KB
+    char numbuf[24];
+
+    for (const auto& row : res.rows) {
+        buf += "ROW ";
+        int n = snprintf(numbuf, sizeof(numbuf), "%d", ncols);
+        buf.append(numbuf, n);
+        buf += ' ';
+        for (int i = 0; i < ncols; ++i) {
+            const std::string& name = res.column_names[i];
+            const std::string& val  = (i < (int)row.size()) ? row[i] : "";
+            n = snprintf(numbuf, sizeof(numbuf), "%zu", name.size());
+            buf.append(numbuf, n); buf += ':'; buf += name;
+            n = snprintf(numbuf, sizeof(numbuf), "%zu", val.size());
+            buf.append(numbuf, n); buf += ':'; buf += val;
+        }
+        buf += '\n';
+
+        if (buf.size() >= FLUSH_THRESHOLD) {
+            if (!send_all(fd, buf)) return false;
+            buf.clear();
+        }
+    }
+    buf += "END\n";
+    return send_all(fd, buf);
+}
+
 std::string recv_response(int fd) {
     // Buffered 4KB reader — eliminates per-char syscall overhead.
     char rbuf[4096];

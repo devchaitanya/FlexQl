@@ -100,6 +100,8 @@ void TcpServer::handle_client(int client_fd) {
         if (sql.empty()) break; // client disconnected
 
         std::string response;
+        QueryResult result;
+        bool        have_result = false;
         try {
             auto        t0   = std::chrono::high_resolution_clock::now();
             Statement   stmt = Parser::parse(sql);
@@ -107,11 +109,11 @@ void TcpServer::handle_client(int client_fd) {
             if (g_wal.is_open() && needs_wal(stmt))
                 g_wal.append(sql);
 
-            QueryResult res  = exec.execute(std::move(stmt));
+            result           = exec.execute(std::move(stmt));
             auto        t1   = std::chrono::high_resolution_clock::now();
-            res.elapsed_us   = std::chrono::duration_cast<
+            result.elapsed_us = std::chrono::duration_cast<
                                    std::chrono::microseconds>(t1 - t0).count();
-            response         = protocol::encode_response(res);
+            have_result      = true;
         } catch (const ParseError& e) {
             response = protocol::encode_response(
                 QueryResult::err(std::string("parse error: ") + e.what()));
@@ -120,7 +122,12 @@ void TcpServer::handle_client(int client_fd) {
                 QueryResult::err(std::string("internal error: ") + e.what()));
         }
 
-        if (!protocol::send_response(client_fd, response)) break;
+        bool ok;
+        if (have_result)
+            ok = protocol::stream_response(client_fd, result);
+        else
+            ok = protocol::send_response(client_fd, response);
+        if (!ok) break;
     }
     ::close(client_fd);
 }

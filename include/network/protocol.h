@@ -24,6 +24,9 @@ namespace protocol {
 // Encode a QueryResult into a wire response string.
 std::string encode_response(const QueryResult& res);
 
+// Stream a QueryResult to fd in chunks (avoids building a multi-GB string).
+bool stream_response(int fd, const QueryResult& res);
+
 // Send all bytes of msg over fd. Returns false on error.
 bool send_all(int fd, const std::string& msg);
 

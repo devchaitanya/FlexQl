@@ -504,10 +504,109 @@ inline void avx2_filter_in(const int64_t* col, size_t n,
 
 } // anonymous namespace
 
+// ── O(1)-memory COUNT ─────────────────────────────────────────────────────────
+size_t Table::count_rows(const Predicate* where) const {
+    std::shared_lock lock(mtx);
+
+    // SIMD fast path for numeric LEAF predicates
+    if (where && where->kind == Predicate::LEAF &&
+        where->op != "IS NULL" && where->op != "IS NOT NULL" &&
+        where->op != "LIKE") {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        int pred_col = schema_.col_index(col_name);
+        if (pred_col >= 0 && is_numeric_col(pred_col) &&
+            pred_col < (int)int_cols_.size() && !int_cols_[pred_col].empty()) {
+            std::vector<size_t> matched;
+            matched.reserve(rows_meta_.size());
+            const int64_t* col_data = int_cols_[pred_col].data();
+            const size_t n = rows_meta_.size();
+            AliveChecker alive{rows_meta_.data(), (int64_t)std::time(nullptr)};
+
+            if (where->op == "BETWEEN" || where->op == "NOT BETWEEN") {
+                avx2_filter_between(col_data, n, alive, parse_int64(where->val),
+                                    parse_int64(where->val2),
+                                    where->op == "NOT BETWEEN", matched);
+            } else if (where->op == "IN" || where->op == "NOT IN") {
+                std::vector<int64_t> targets;
+                targets.reserve(where->in_vals.size());
+                for (const auto& v : where->in_vals)
+                    targets.push_back(parse_int64(v));
+                avx2_filter_in(col_data, n, alive, targets,
+                               where->op == "NOT IN", matched);
+            } else {
+                avx2_filter_cmp(col_data, n, alive, where->op,
+                                parse_int64(where->val), matched);
+            }
+            return matched.size();
+        }
+    }
+
+    // General fallback
+    size_t count = 0;
+    for (size_t i = 0; i < rows_meta_.size(); ++i) {
+        if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
+        if (where && !matches_pred(i, *where)) continue;
+        ++count;
+    }
+    return count;
+}
+
+// ── O(1)-memory aggregate (SUM/MIN/MAX) ───────────────────────────────────────
+Table::AggResult Table::compute_aggregate(int col_idx, const Predicate* where) const {
+    std::shared_lock lock(mtx);
+    AggResult r;
+    bool use_int = is_numeric_col(col_idx) &&
+                   col_idx < (int)int_cols_.size() &&
+                   !int_cols_[col_idx].empty();
+
+    for (size_t i = 0; i < rows_meta_.size(); ++i) {
+        if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
+        if (where && !matches_pred(i, *where)) continue;
+
+        if (use_int) {
+            int64_t v = int_cols_[col_idx][i];
+            double  d = static_cast<double>(v);
+            r.sum += d;
+            if (r.count == 0 || d < r.min_val) {
+                r.min_val = d;
+                r.min_str = std::to_string(v);
+            }
+            if (r.count == 0 || d > r.max_val) {
+                r.max_val = d;
+                r.max_str = std::to_string(v);
+            }
+        } else {
+            std::string_view sv = val_at(i, col_idx);
+            try {
+                double d = std::stod(std::string(sv));
+                r.sum += d;
+                if (r.count == 0 || d < r.min_val) {
+                    r.min_val = d;
+                    r.min_str = std::string(sv);
+                }
+                if (r.count == 0 || d > r.max_val) {
+                    r.max_val = d;
+                    r.max_str = std::string(sv);
+                }
+            } catch (...) {
+                if (r.min_str.empty() || std::string(sv) < r.min_str)
+                    r.min_str = std::string(sv);
+                if (r.max_str.empty() || std::string(sv) > r.max_str)
+                    r.max_str = std::string(sv);
+            }
+        }
+        ++r.count;
+    }
+    return r;
+}
+
 // ── Scan ──────────────────────────────────────────────────────────────────────
 QueryResult Table::scan(const std::vector<std::string>& select_cols,
                          const Predicate* where,
-                         const std::vector<OrderByClause>& order_by) const {
+                         const std::vector<OrderByClause>& order_by,
+                         int limit, int offset) const {
     std::shared_lock lock(mtx);
 
     // Resolve column indices
@@ -617,14 +716,18 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
 
     // General scan fallback
     if (!used_simd) {
+        // Early-out when no ORDER BY and we have a LIMIT: stop after enough rows
+        const bool can_early_out = order_by.empty() && limit >= 0;
+        const size_t need = can_early_out ? (size_t)(offset + limit) : SIZE_MAX;
         for (size_t i = 0; i < rows_meta_.size(); ++i) {
             if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
             if (where && !matches_pred(i, *where)) continue;
             row_idxs.push_back(i);
+            if (row_idxs.size() >= need) break;
         }
     }
 
-    // ORDER BY — multi-column stable sort (rightmost key applied first)
+    // ORDER BY — use partial_sort when LIMIT is set (O(n log k) vs O(n log n))
     if (!order_by.empty()) {
         // Resolve each ORDER BY key to a schema column index
         struct SortKey { int col_idx; bool numeric; bool desc; };
@@ -639,41 +742,58 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
                             schema_.columns[schema_col].type == ColumnType::DECIMAL);
             keys.push_back({schema_col, numeric, ob.desc});
         }
-        // Apply keys right-to-left so leftmost key dominates
-        for (int ki = (int)keys.size() - 1; ki >= 0; --ki) {
-            const auto& k = keys[ki];
-            // Use int_cols_ for numeric sort (avoids stod per comparison)
-            const bool use_int = k.numeric && k.col_idx < (int)int_cols_.size() &&
-                                 !int_cols_[k.col_idx].empty();
-            std::stable_sort(row_idxs.begin(), row_idxs.end(),
-                [&](size_t a, size_t b) {
-                    bool less_than;
-                    if (use_int) {
-                        int64_t va = int_cols_[k.col_idx][a];
-                        int64_t vb = int_cols_[k.col_idx][b];
-                        less_than = va < vb;
-                    } else if (k.numeric) {
-                        std::string_view sva = val_at(a, k.col_idx);
-                        std::string_view svb = val_at(b, k.col_idx);
-                        try {
-                            less_than = std::stod(std::string(sva)) < std::stod(std::string(svb));
-                        } catch (...) {
-                            less_than = sva < svb;
-                        }
-                    } else {
-                        less_than = val_at(a, k.col_idx) < val_at(b, k.col_idx);
+
+        // Build a single combined comparator for all keys (left-to-right priority)
+        auto cmp = [&](size_t a, size_t b) -> bool {
+            for (const auto& k : keys) {
+                const bool use_int = k.numeric && k.col_idx < (int)int_cols_.size() &&
+                                     !int_cols_[k.col_idx].empty();
+                int r;
+                if (use_int) {
+                    int64_t va = int_cols_[k.col_idx][a];
+                    int64_t vb = int_cols_[k.col_idx][b];
+                    r = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+                } else if (k.numeric) {
+                    std::string_view sva = val_at(a, k.col_idx);
+                    std::string_view svb = val_at(b, k.col_idx);
+                    try {
+                        double da = std::stod(std::string(sva));
+                        double db = std::stod(std::string(svb));
+                        r = (da < db) ? -1 : (da > db) ? 1 : 0;
+                    } catch (...) {
+                        r = sva.compare(svb);
                     }
-                    return k.desc ? !less_than : less_than;
-                });
+                } else {
+                    r = val_at(a, k.col_idx).compare(val_at(b, k.col_idx));
+                }
+                if (r != 0)
+                    return k.desc ? (r > 0) : (r < 0);
+            }
+            return false; // equal
+        };
+
+        // partial_sort when we know the output size; full stable_sort otherwise
+        size_t k = row_idxs.size();
+        if (limit >= 0) {
+            k = std::min(k, (size_t)(offset > 0 ? offset : 0) + (size_t)limit);
+            std::partial_sort(row_idxs.begin(),
+                              row_idxs.begin() + (ptrdiff_t)k,
+                              row_idxs.end(), cmp);
+        } else {
+            std::stable_sort(row_idxs.begin(), row_idxs.end(), cmp);
         }
     }
 
-    // Project in sorted order
+    // Apply OFFSET + LIMIT, then project only the needed rows
+    size_t start = 0, end = row_idxs.size();
+    if (offset > 0) start = std::min((size_t)offset, end);
+    if (limit >= 0)  end   = std::min(end, start + (size_t)limit);
+
     QueryResult res;
     res.column_names = out_names;
-    res.rows.reserve(row_idxs.size());
-    for (size_t i : row_idxs)
-        res.rows.push_back(project(i, col_indices));
+    res.rows.reserve(end - start);
+    for (size_t i = start; i < end; ++i)
+        res.rows.push_back(project(row_idxs[i], col_indices));
 
     return res;
 }

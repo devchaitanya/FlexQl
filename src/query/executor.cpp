@@ -158,47 +158,33 @@ QueryResult Executor::exec_select(const SelectStmt& s) {
 
     // ── Aggregate ─────────────────────────────────────────────────────────────
     if (!s.agg_func.empty()) {
-        QueryResult base = tbl->scan({"*"}, s.where.get(), {});
-        if (!base.ok) return base;
+        // COUNT(*) — O(1) memory, no row materialisation.
+        if (s.agg_func == "COUNT") {
+            size_t cnt = tbl->count_rows(s.where.get());
+            QueryResult res;
+            res.ok = true;
+            res.column_names = {"COUNT(" + s.agg_col + ")"};
+            res.rows = {{std::to_string(cnt)}};
+            return res;
+        }
+
+        // SUM/AVG/MIN/MAX — single-pass, O(1) memory.
+        int col_idx = -1;
+        for (int i = 0; i < (int)tbl->schema().columns.size(); ++i)
+            if (strutil::iequals(tbl->schema().columns[i].name, s.agg_col)) { col_idx = i; break; }
+        if (col_idx < 0) return QueryResult::err("unknown column: " + s.agg_col);
+
+        auto agg = tbl->compute_aggregate(col_idx, s.where.get());
+
+        std::string result;
+        if      (s.agg_func == "SUM") result = (agg.count > 0) ? std::to_string(agg.sum) : "0";
+        else if (s.agg_func == "AVG") result = (agg.count > 0) ? std::to_string(agg.sum / agg.count) : "0";
+        else if (s.agg_func == "MIN") result = agg.min_str;
+        else if (s.agg_func == "MAX") result = agg.max_str;
 
         QueryResult res;
         res.ok = true;
         res.column_names = {s.agg_func + "(" + s.agg_col + ")"};
-
-        if (s.agg_func == "COUNT") {
-            res.rows = {{std::to_string(base.rows.size())}};
-            return res;
-        }
-
-        int col_idx = -1;
-        for (int i = 0; i < (int)base.column_names.size(); ++i)
-            if (strutil::iequals(base.column_names[i], s.agg_col)) { col_idx = i; break; }
-        if (col_idx < 0) return QueryResult::err("unknown column: " + s.agg_col);
-
-        double sum = 0, minv = DBL_MAX, maxv = -DBL_MAX;
-        std::string minstr, maxstr;
-        int count = 0;
-        for (const auto& row : base.rows) {
-            if (col_idx >= (int)row.size()) continue;
-            const std::string& v = row[col_idx];
-            try {
-                double d = std::stod(v);
-                sum += d;
-                if (d < minv) { minv = d; minstr = v; }
-                if (d > maxv) { maxv = d; maxstr = v; }
-                ++count;
-            } catch (...) {
-                if (minstr.empty() || v < minstr) minstr = v;
-                if (maxstr.empty() || v > maxstr) maxstr = v;
-                ++count;
-            }
-        }
-
-        std::string result;
-        if      (s.agg_func == "SUM") result = (count > 0) ? std::to_string(sum) : "0";
-        else if (s.agg_func == "AVG") result = (count > 0) ? std::to_string(sum/count) : "0";
-        else if (s.agg_func == "MIN") result = minstr;
-        else if (s.agg_func == "MAX") result = maxstr;
         res.rows = {{result}};
         return res;
     }
@@ -233,7 +219,11 @@ QueryResult Executor::exec_select(const SelectStmt& s) {
     if (!cache_key.empty())
         if (auto* cached = g_cache.get(cache_key)) return *cached;
 
-    QueryResult res = tbl->scan(s.cols, s.where.get(), s.order_by);
+    // Push LIMIT/OFFSET into scan() unless DISTINCT needs all rows first
+    int scan_limit  = s.distinct ? -1 : s.limit;
+    int scan_offset = s.distinct ?  0 : s.offset;
+    QueryResult res = tbl->scan(s.cols, s.where.get(), s.order_by,
+                                scan_limit, scan_offset);
     if (!res.ok) return res;
 
     // Apply AS aliases to output column names
@@ -250,16 +240,15 @@ QueryResult Executor::exec_select(const SelectStmt& s) {
             if (seen.insert(row).second)
                 unique_rows.push_back(std::move(row));
         res.rows = std::move(unique_rows);
+
+        // Apply OFFSET/LIMIT after dedup (not pushed into scan for DISTINCT)
+        if (s.offset > 0 && s.offset < (int)res.rows.size())
+            res.rows.erase(res.rows.begin(), res.rows.begin() + s.offset);
+        else if (s.offset >= (int)res.rows.size())
+            res.rows.clear();
+        if (s.limit >= 0 && (int)res.rows.size() > s.limit)
+            res.rows.resize(s.limit);
     }
-
-    // OFFSET
-    if (s.offset > 0 && s.offset < (int)res.rows.size())
-        res.rows.erase(res.rows.begin(), res.rows.begin() + s.offset);
-    else if (s.offset >= (int)res.rows.size())
-        res.rows.clear();
-
-    if (s.limit >= 0 && (int)res.rows.size() > s.limit)
-        res.rows.resize(s.limit);
 
     if (!cache_key.empty())
         g_cache.put(cache_key, res, strutil::to_upper(s.table));
@@ -271,8 +260,33 @@ QueryResult Executor::exec_group_by(const SelectStmt& s) {
     auto tbl = Database::instance().get_table(s.table);
     if (!tbl) return QueryResult::err("no such table: " + s.table);
 
-    // Full scan first
-    QueryResult base = tbl->scan({"*"}, s.where.get(), {});
+    // Collect only the columns actually needed (group-by + aggregate targets)
+    std::vector<std::string> needed;
+    for (const auto& g : s.group_by) {
+        std::string gn = g;
+        size_t dot = gn.find('.');
+        if (dot != std::string::npos) gn = gn.substr(dot + 1);
+        bool dup = false;
+        for (auto& n : needed) if (strutil::iequals(n, gn)) { dup = true; break; }
+        if (!dup) needed.push_back(gn);
+    }
+    for (const auto& c : s.cols) {
+        size_t lp = c.find('(');
+        if (lp != std::string::npos) {
+            std::string arg = c.substr(lp + 1, c.size() - lp - 2);
+            if (arg != "*" && !arg.empty()) {
+                std::string an = arg;
+                size_t dot = an.find('.');
+                if (dot != std::string::npos) an = an.substr(dot + 1);
+                bool dup = false;
+                for (auto& n : needed) if (strutil::iequals(n, an)) { dup = true; break; }
+                if (!dup) needed.push_back(an);
+            }
+        }
+    }
+
+    QueryResult base = tbl->scan(needed.empty() ? std::vector<std::string>{"*"} : needed,
+                                 s.where.get(), {});
     if (!base.ok) return base;
 
     // Index group-by columns in result

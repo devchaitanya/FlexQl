@@ -63,7 +63,22 @@ public:
     // ── Read operations ───────────────────────────────────────────────────────
     QueryResult scan(const std::vector<std::string>& select_cols,
                      const Predicate* where,
-                     const std::vector<OrderByClause>& order_by) const;
+                     const std::vector<OrderByClause>& order_by,
+                     int limit = -1, int offset = 0) const;
+
+    // O(1)-memory aggregate: counts matching rows without materializing them.
+    size_t count_rows(const Predicate* where) const;
+
+    // O(1)-memory aggregate: computes SUM/MIN/MAX in a single pass.
+    struct AggResult {
+        double      sum     = 0;
+        double      min_val = 0;
+        double      max_val = 0;
+        std::string min_str;
+        std::string max_str;
+        int64_t     count   = 0;
+    };
+    AggResult compute_aggregate(int col_idx, const Predicate* where) const;
 
     // Raw access for JOIN (caller holds shared_lock externally).
     std::vector<std::pair<std::vector<std::string>, size_t>> live_rows() const;
