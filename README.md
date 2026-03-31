@@ -1,6 +1,6 @@
 # FlexQL — A Flexible SQL-like Database Driver
 
-A client-server database engine implemented in C++17 from scratch. Supports a rich SQL subset with compound predicates, aggregates, GROUP BY, LEFT JOIN, TTL expiration, LRU query caching, Write-Ahead Log (WAL) persistence, binary snapshots, and multi-threaded concurrency.
+A client-server database engine implemented in C++17 from scratch. Supports a SQL subset with single-condition WHERE, aggregates, GROUP BY, INNER/LEFT JOIN, TTL expiration, LRU query caching, Write-Ahead Log (WAL) persistence, binary snapshots, and multi-threaded concurrency.
 
 ---
 
@@ -82,7 +82,7 @@ flexql/
 │   ├── index/pk_index.h              # PrimaryIndex — FNV-64 flat open-addressing hash map
 │   ├── parser/
 │   │   ├── token.h                   # Tokenizer, Token, TokenType
-│   │   ├── ast.h                     # Statement AST (Predicate tree, InsertStmt flat layout)
+│   │   ├── ast.h                     # Statement AST (single-condition WHERE, InsertStmt flat layout)
 │   │   └── parser.h                  # Recursive descent Parser
 │   ├── query/executor.h              # Executor — routes statements to handlers
 │   ├── network/
@@ -253,9 +253,9 @@ INSERT INTO T VALUES (1,'Alice',30,ts), (2,'Bob',25,ts), ...;
 SELECT * FROM T;
 SELECT ID, NAME FROM T;
 
--- Compound WHERE (AND / OR / NOT)
-SELECT * FROM T WHERE AGE >= 18 AND DEPT = 'Eng';
-SELECT * FROM T WHERE NOT (AGE < 18 OR STATUS = 'inactive');
+-- Single-condition WHERE (one predicate per WHERE clause)
+SELECT * FROM T WHERE AGE >= 18;
+SELECT * FROM T WHERE DEPT = 'Eng';
 
 -- BETWEEN / IN / IS NULL
 SELECT * FROM T WHERE AGE BETWEEN 20 AND 30;
@@ -281,7 +281,7 @@ SELECT SUM(SALARY), AVG(SALARY), MIN(SALARY), MAX(SALARY) FROM T;
 SELECT DEPT, COUNT(*), AVG(SALARY) FROM T GROUP BY DEPT HAVING AVG(SALARY) > 70000;
 
 -- INNER JOIN
-SELECT * FROM A INNER JOIN B ON A.ID = B.AID WHERE B.STATUS = 'active' ORDER BY A.ID;
+SELECT * FROM A INNER JOIN B ON A.ID = B.AID ORDER BY A.ID;
 
 -- LEFT OUTER JOIN
 SELECT * FROM A LEFT JOIN B ON A.ID = B.AID;
@@ -460,8 +460,8 @@ Progress: 100000/1000000
 Progress: 1000000/1000000
 [PASS] INSERT benchmark complete
 Rows inserted: 1000000
-Elapsed: 334 ms
-Throughput: 2994011 rows/sec
+Elapsed: 306 ms
+Throughput: 3267973 rows/sec
 ```
 
 ---
@@ -484,22 +484,14 @@ Throughput: 2994011 rows/sec
 
 ### Measured Results (i5-1135G7 @ 2.40 GHz, 14 GB RAM)
 
-**INSERT throughput — batch size 25,000:**
-
-| Dataset | Elapsed | Throughput |
-|---|---|---|
-| 1M rows | 264 ms | 3,787,878 rows/sec |
-| 10M rows | 2,748 ms | 3,639,010 rows/sec |
-
 **INSERT throughput — batch size 5,000:**
 
 | Dataset | Elapsed | Throughput |
 |---|---|---|
-| 1M rows | 334 ms | 2,994,011 rows/sec |
-| 10M rows | 3,065 ms | 3,262,642 rows/sec |
-| 20M rows | 6,385 ms | 3,132,341 rows/sec |
+| 1M rows | 306 ms | 3,267,973 rows/sec |
+| 10M rows | 3,163 ms | 3,161,555 rows/sec |
 
-Larger batches reduce TCP round-trips and lock acquisitions, yielding ~10–21% higher throughput. Throughput degrades slightly at scale due to hash-table rehashing and memory pressure.
+Throughput degrades slightly at scale due to hash-table rehashing and memory pressure.
 
 WAL adds only ~50ms per 1M rows because writes go to the kernel page cache (no `fdatasync` in the hot path). Data is safe against process crashes; the trade-off is that an OS crash could lose the last few un-fsynced records.
 
@@ -511,3 +503,52 @@ WAL adds only ~50ms per 1M rows because writes go to the kernel page cache (no `
 | Non-PK scan | Sequential `rows_vals_` traversal | O(n) cache-friendly |
 | Repeated SELECT | LRU cache hit | O(1), no table lock |
 | Concurrent SELECTs | `shared_lock` — readers run in parallel | Linear scaling |
+
+### Full Benchmark Results (1M-row table)
+
+| Category | Query | Rows | Elapsed |
+|---|---|---|---|
+| Scan | `COUNT(*)` | 1 | 167 ms |
+| Scan | Full table scan | 1,000,000 | 1,391 ms |
+| PK lookup | `WHERE ID = 500000` | 1 | 111 ms |
+| Filter | `WHERE SALARY > 90000` | 139,986 | 282 ms |
+| Filter | `WHERE SALARY BETWEEN 50000 AND 60000` | 140,015 | 347 ms |
+| Filter | `WHERE DEPT IN ('ENG','HR','FIN')` | 375,000 | 540 ms |
+| Pattern | `WHERE NAME LIKE 'user1%'` | 111,112 | 169 ms |
+| Sort | `ORDER BY SALARY DESC LIMIT 10` | 10 | 1,147 ms |
+| Sort | `ORDER BY ID DESC LIMIT 100 OFFSET 1000` | 100 | 895 ms |
+| Distinct | `SELECT DISTINCT DEPT` | 8 | 90 ms |
+| Aggregate | `SUM(SALARY)` | 1 | 167 ms |
+| Aggregate | `AVG(SALARY)` | 1 | 179 ms |
+| Aggregate | `MIN / MAX` | 1 | 175–177 ms |
+| Group By | `GROUP BY DEPT` (8 groups) | 8 | 225 ms |
+| Group By | `HAVING AVG(SALARY) > 60000` | 8 | 172 ms |
+| Join | `INNER JOIN` (1M × 8) | 1,000,000 | 884 ms |
+| Join | `INNER JOIN + WHERE` | 139,986 | 349 ms |
+| Join | `LEFT JOIN` (1M × 8) | 1,000,000 | 1,084 ms |
+| Cache | Cold → Warm | 1 | 108 ms → 0.03 ms (3,362× speedup) |
+| Update | Single row `WHERE ID=1` | — | 150 ms |
+| Update | 1,000 rows `WHERE ID<=1000` | — | 137 ms |
+| Update | Filtered `WHERE DEPT='QA'` | — | 51 ms |
+| Delete | 100 rows `WHERE ID<=100` | — | 136 ms |
+| Delete | Filtered `WHERE DEPT='LEGAL'` | — | 54 ms |
+
+### Concurrency
+
+| Threads | Queries | Avg Latency | Wall-clock |
+|---|---|---|---|
+| 1 | 20 | 98 ms | 136 ms |
+| 4 | 80 | 86 ms | 220 ms |
+| 8 | 160 | 60 ms | 441 ms |
+
+### Memory Footprint
+
+| State | Server RSS |
+|---|---|
+| Idle (no tables) | 7.0 MB |
+| After 1M-row seed (5 cols) | 138.8 MB |
+| After full benchmark suite | ~978 MB |
+
+### Test Suite
+
+564 / 564 standalone tests pass (`make test`).

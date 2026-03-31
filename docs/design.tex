@@ -677,7 +677,7 @@ Filtered scans with compound \texttt{WHERE} scale linearly with the output-set s
 \texttt{UPDATE} 1,000 rows (\texttt{WHERE ID<=1000})             & 143\,ms \\
 \texttt{UPDATE} filtered (\texttt{WHERE DEPT='QA'})               & 73\,ms  \\
 \texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 143\,ms  \\
-\texttt{DELETE} filtered (\texttt{WHERE DEPT='LEGAL'})
+\texttt{DELETE} filtered (\texttt{WHERE DEPT='LEGAL'})            & 72\,ms   \\
 \bottomrule
 \end{tabular}
 \caption{UPDATE / DELETE latencies on 1\,M-row table}
@@ -781,7 +781,7 @@ memory before being cleaned up.
 
 \subsection{Unit Test Results}
 
-\textbf{560 / 560} standalone tests pass (\texttt{make test}). Test categories: parser
+\textbf{564 / 564} standalone tests pass (\texttt{make test}). Test categories: parser
 (17 functions), primary-key index (3), StringArena (4), table storage (10), executor
 end-to-end (6), concurrency stress (3), adversarial inputs (5). Sanitiser targets
 \texttt{make test-asan} and \texttt{make test-tsan} are also available.
