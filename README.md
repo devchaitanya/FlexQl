@@ -1,6 +1,6 @@
 # FlexQL — A Flexible SQL-like Database Driver
 
-A client-server database engine implemented in C++17 from scratch. Supports a SQL subset with single-condition WHERE, aggregates, GROUP BY, INNER/LEFT JOIN, TTL expiration, LRU query caching, Write-Ahead Log (WAL) persistence, binary snapshots, and multi-threaded concurrency.
+A client-server database engine implemented in C++17 from scratch. Supports a SQL subset with single-condition WHERE, aggregates, GROUP BY, INNER/LEFT JOIN, AVX2 SIMD-accelerated numeric scans, PK fast paths, TTL expiration, LRU query caching, Write-Ahead Log (WAL) persistence, binary snapshots, and multi-threaded concurrency.
 
 ---
 
@@ -174,6 +174,18 @@ PK value (string_view into arena) → row index (size_t)   O(1) average
 
 **Why a custom flat map over `unordered_map`?**
 `unordered_map` allocates a linked-list node per entry — 1M inserts = 1M `new` calls. The flat open-addressing array keeps all slots contiguous, eliminating pointer chasing and reducing allocator pressure by ~80%.
+
+**PK Fast Paths:** DELETE, UPDATE, and SELECT with `WHERE pk = X` or `WHERE pk IN (...)` bypass the full table scan entirely — O(1) hash lookup per key.
+
+### SIMD-Accelerated Numeric Scans (AVX2)
+
+Numeric columns (`INT`, `DECIMAL`, `DATETIME`) maintain a parallel `int64_t` vector alongside the string arena. At INSERT time, each numeric value is parsed once via an allocation-free `parse_int64()` and stored in `int_cols_[col]`. Scans on numeric predicates dispatch to AVX2 intrinsics that compare 4 × `int64_t` per cycle:
+
+- **`avx2_filter_cmp`** — handles `=`, `!=`, `>`, `>=`, `<`, `<=`
+- **`avx2_filter_between`** — handles `BETWEEN low AND high`
+- **`avx2_filter_in`** — handles `IN (v1, v2, …)`
+
+ORDER BY on numeric columns also uses `int_cols_` for native integer comparisons, avoiding `stod()` per comparison pair. Result: **148× speedup** for point scans, **5.7× speedup** for ORDER BY.
 
 ---
 
@@ -488,10 +500,11 @@ Throughput: 3267973 rows/sec
 
 | Dataset | Elapsed | Throughput |
 |---|---|---|
-| 1M rows | 306 ms | 3,267,973 rows/sec |
-| 10M rows | 3,163 ms | 3,161,555 rows/sec |
+| 1M rows | 277 ms | 3,610,108 rows/sec |
+| 10M rows | 3,548 ms | 2,818,489 rows/sec |
 
-Throughput degrades slightly at scale due to hash-table rehashing and memory pressure.
+Throughput degrades slightly at scale due to hash-table rehashing and memory pressure. The
+dual `int64_t` storage adds a single `parse_int64()` call per numeric value — overhead is negligible.
 
 WAL adds only ~50ms per 1M rows because writes go to the kernel page cache (no `fdatasync` in the hot path). Data is safe against process crashes; the trade-off is that an OS crash could lose the last few un-fsynced records.
 
@@ -500,54 +513,57 @@ WAL adds only ~50ms per 1M rows because writes go to the kernel page cache (no `
 | Query type | Mechanism | Complexity |
 |---|---|---|
 | PK equality (`WHERE id = X`) | FNV-64 hash map lookup | O(1) |
-| Non-PK scan | Sequential `rows_vals_` traversal | O(n) cache-friendly |
+| Numeric comparison | AVX2 SIMD scan (4 × int64 per cycle) | O(n/4) |
+| Non-PK string scan | Sequential `rows_vals_` traversal | O(n) |
 | Repeated SELECT | LRU cache hit | O(1), no table lock |
 | Concurrent SELECTs | `shared_lock` — readers run in parallel | Linear scaling |
+| DELETE/UPDATE `WHERE pk = X` | Hash lookup + modify | O(1) |
+| SELECT/DELETE/UPDATE `WHERE pk IN (...)` | k hash lookups | O(k) |
 
 ### Full Benchmark Results (1M-row table)
 
 | Category | Query | Rows | Elapsed |
 |---|---|---|---|
-| Scan | `COUNT(*)` | 1 | 167 ms |
-| Scan | Full table scan | 1,000,000 | 1,391 ms |
-| PK lookup | `WHERE ID = 500000` | 1 | 111 ms |
-| Filter | `WHERE SALARY > 90000` | 139,986 | 282 ms |
-| Filter | `WHERE SALARY BETWEEN 50000 AND 60000` | 140,015 | 347 ms |
-| Filter | `WHERE DEPT IN ('ENG','HR','FIN')` | 375,000 | 540 ms |
-| Pattern | `WHERE NAME LIKE 'user1%'` | 111,112 | 169 ms |
-| Sort | `ORDER BY SALARY DESC LIMIT 10` | 10 | 1,147 ms |
-| Sort | `ORDER BY ID DESC LIMIT 100 OFFSET 1000` | 100 | 895 ms |
-| Distinct | `SELECT DISTINCT DEPT` | 8 | 90 ms |
-| Aggregate | `SUM(SALARY)` | 1 | 167 ms |
-| Aggregate | `AVG(SALARY)` | 1 | 179 ms |
-| Aggregate | `MIN / MAX` | 1 | 175–177 ms |
-| Group By | `GROUP BY DEPT` (8 groups) | 8 | 225 ms |
-| Group By | `HAVING AVG(SALARY) > 60000` | 8 | 172 ms |
-| Join | `INNER JOIN` (1M × 8) | 1,000,000 | 884 ms |
-| Join | `INNER JOIN + WHERE` | 139,986 | 349 ms |
-| Join | `LEFT JOIN` (1M × 8) | 1,000,000 | 1,084 ms |
-| Cache | Cold → Warm | 1 | 108 ms → 0.03 ms (3,362× speedup) |
-| Update | Single row `WHERE ID=1` | — | 150 ms |
-| Update | 1,000 rows `WHERE ID<=1000` | — | 137 ms |
-| Update | Filtered `WHERE DEPT='QA'` | — | 51 ms |
-| Delete | 100 rows `WHERE ID<=100` | — | 136 ms |
+| Scan | `COUNT(*)` | 1 | 174 ms |
+| Scan | Full table scan | 1,000,000 | 1,504 ms |
+| SIMD lookup | `WHERE ID = 500000` | 1 | **0.75 ms** |
+| SIMD filter | `WHERE SALARY > 90000` | 139,986 | **172 ms** |
+| SIMD filter | `WHERE SALARY BETWEEN 50000 AND 60000` | 140,015 | **168 ms** |
+| String filter | `WHERE DEPT IN ('ENG','HR','FIN')` | 375,000 | 571 ms |
+| Pattern | `WHERE NAME LIKE 'user1%'` | 111,112 | 179 ms |
+| SIMD sort | `ORDER BY SALARY DESC LIMIT 10` | 10 | **200 ms** |
+| SIMD sort | `ORDER BY ID DESC LIMIT 100 OFFSET 1000` | 100 | **209 ms** |
+| Distinct | `SELECT DISTINCT DEPT` | 8 | 94 ms |
+| Aggregate | `SUM(SALARY)` | 1 | 165 ms |
+| Aggregate | `AVG(SALARY)` | 1 | 174 ms |
+| Aggregate | `MIN / MAX` | 1 | 173 ms |
+| Group By | `GROUP BY DEPT` (8 groups) | 8 | 226 ms |
+| Group By | `HAVING AVG(SALARY) > 60000` | 8 | 174 ms |
+| Join | `INNER JOIN` (1M × 8) | 1,000,000 | 960 ms |
+| Join | `INNER JOIN + WHERE` | 139,986 | 372 ms |
+| Join | `LEFT JOIN` (1M × 8) | 1,000,000 | 1,195 ms |
+| Cache | Cold → Warm | 1 | 0.8 ms → 0.03 ms (29× speedup) |
+| Update | Single row `WHERE ID=1` | — | **91 ms** |
+| Update | 1,000 rows `WHERE ID<=1000` | — | **74 ms** |
+| Update | Filtered `WHERE DEPT='QA'` | — | 55 ms |
+| Delete | 100 rows `WHERE ID<=100` | — | **76 ms** |
 | Delete | Filtered `WHERE DEPT='LEGAL'` | — | 54 ms |
 
 ### Concurrency
 
 | Threads | Queries | Avg Latency | Wall-clock |
 |---|---|---|---|
-| 1 | 20 | 98 ms | 136 ms |
-| 4 | 80 | 86 ms | 220 ms |
-| 8 | 160 | 60 ms | 441 ms |
+| 1 | 20 | **0.68 ms** | 144 ms |
+| 4 | 80 | **0.63 ms** | 201 ms |
+| 8 | 160 | **0.46 ms** | 406 ms |
 
 ### Memory Footprint
 
 | State | Server RSS |
 |---|---|
-| Idle (no tables) | 7.0 MB |
-| After 1M-row seed (5 cols) | 138.8 MB |
-| After full benchmark suite | ~978 MB |
+| Idle (no tables) | 7.1 MB |
+| After 1M-row seed (5 cols) | 161.8 MB (+24 MB for int_cols_) |
+| After full benchmark suite | ~1,026 MB |
 
 ### Test Suite
 

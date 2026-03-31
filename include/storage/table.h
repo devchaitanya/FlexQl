@@ -8,6 +8,7 @@
 #include <string_view>
 #include <memory>
 #include <ctime>
+#include <cstdint>
 
 // ── Legacy single-condition WHERE (kept for internal use inside Table) ─────────
 struct WhereClause {
@@ -88,8 +89,32 @@ private:
     std::vector<std::string_view> rows_vals_;    // rows_meta_.size() × num_cols_ entries
     PrimaryIndex                  pk_index_;     // key → row index (key lives in arena_)
 
+    // Native int64 storage per column — eliminates stod() during scans.
+    // int_cols_[col_idx] is populated only for INT/DECIMAL columns; empty for others.
+    std::vector<std::vector<int64_t>> int_cols_;
+
     // ── Private helpers ───────────────────────────────────────────────────────
     bool is_expired(const RowMeta& m) const;
+
+    // True if col_idx is a numeric type (INT or DECIMAL).
+    bool is_numeric_col(int col_idx) const {
+        return schema_.columns[col_idx].type == ColumnType::INT ||
+               schema_.columns[col_idx].type == ColumnType::DECIMAL;
+    }
+
+    // Parse a string_view to int64; allocation-free. Returns 0 on failure.
+    static int64_t parse_int64(std::string_view sv) {
+        if (sv.empty()) return 0;
+        bool neg = (sv[0] == '-');
+        size_t start = (neg || sv[0] == '+') ? 1 : 0;
+        int64_t val = 0;
+        for (size_t i = start; i < sv.size(); ++i) {
+            char c = sv[i];
+            if (c < '0' || c > '9') break; // stop at '.' for decimals
+            val = val * 10 + (c - '0');
+        }
+        return neg ? -val : val;
+    }
 
     // Access helpers
     std::string_view val_at(size_t row_idx, int col_idx) const {

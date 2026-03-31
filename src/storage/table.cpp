@@ -5,11 +5,13 @@
 #include <mutex>
 #include <stdexcept>
 #include <ctime>
+#include <immintrin.h>   // AVX2 / SSE intrinsics
 
 // ── Construction ──────────────────────────────────────────────────────────────
 Table::Table(TableSchema schema)
     : schema_(std::move(schema)),
-      num_cols_((int)schema_.columns.size()) {}
+      num_cols_((int)schema_.columns.size()),
+      int_cols_((size_t)num_cols_) {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 bool Table::is_expired(const RowMeta& m) const {
@@ -90,10 +92,41 @@ bool Table::matches_pred(size_t row_idx, const Predicate& pred) const {
             int idx = schema_.col_index(col_name);
             if (idx < 0 || idx >= num_cols_) return false;
             std::string_view row_val = val_at(row_idx, idx);
-            ColumnType ct = schema_.columns[idx].type;
 
             if (pred.op == "IS NULL")     return row_val.empty();
             if (pred.op == "IS NOT NULL") return !row_val.empty();
+
+            // Fast path: use native int64 for numeric columns (no stod overhead)
+            if (is_numeric_col(idx) && idx < (int)int_cols_.size() &&
+                !int_cols_[idx].empty()) {
+                int64_t rv = int_cols_[idx][row_idx];
+
+                if (pred.op == "BETWEEN" || pred.op == "NOT BETWEEN") {
+                    int64_t lo = parse_int64(pred.val);
+                    int64_t hi = parse_int64(pred.val2);
+                    bool in_range = rv >= lo && rv <= hi;
+                    return pred.op == "BETWEEN" ? in_range : !in_range;
+                }
+                if (pred.op == "IN" || pred.op == "NOT IN") {
+                    bool found = false;
+                    for (const auto& v : pred.in_vals)
+                        if (rv == parse_int64(v)) { found = true; break; }
+                    return pred.op == "IN" ? found : !found;
+                }
+                if (pred.op == "LIKE") return like_match(row_val, pred.val);
+
+                int64_t tv = parse_int64(pred.val);
+                if (pred.op == "=")  return rv == tv;
+                if (pred.op == "!=") return rv != tv;
+                if (pred.op == ">")  return rv > tv;
+                if (pred.op == ">=") return rv >= tv;
+                if (pred.op == "<")  return rv < tv;
+                if (pred.op == "<=") return rv <= tv;
+                return false;
+            }
+
+            // String / non-numeric fallback
+            ColumnType ct = schema_.columns[idx].type;
 
             if (pred.op == "BETWEEN" || pred.op == "NOT BETWEEN") {
                 bool in_range = !compare_values(row_val, "<", pred.val, ct) &&
@@ -145,6 +178,11 @@ std::string Table::insert(std::vector<std::string> values, int64_t expires_at) {
         rows_vals_.push_back(arena_.intern(v));
     rows_meta_.push_back({expires_at, false});
 
+    // Populate native int64 columns
+    for (int c = 0; c < num_cols_; ++c)
+        if (is_numeric_col(c))
+            int_cols_[c].push_back(parse_int64(values[c]));
+
     if (schema_.pk_col_index >= 0)
         pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
 
@@ -167,10 +205,14 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
         size_t est = std::max(n_rows * 200UL, 1000000UL);
         rows_meta_.reserve(est);
         rows_vals_.reserve(est * (size_t)num_cols_);
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c)) int_cols_[c].reserve(est);
     } else if (rows_meta_.capacity() < rows_meta_.size() + n_rows) {
         size_t new_cap = std::max(rows_meta_.size() * 2, rows_meta_.size() + n_rows);
         rows_meta_.reserve(new_cap);
         rows_vals_.reserve(new_cap * (size_t)num_cols_);
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c)) int_cols_[c].reserve(new_cap);
     }
 
     const bool has_pk = schema_.pk_col_index >= 0;
@@ -189,6 +231,13 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
             for (int c = 0; c < num_cols_; ++c)
                 rows_vals_[vi++] = arena_.intern(row[c]);
         }
+        // Populate native int64 columns
+        for (int c = 0; c < num_cols_; ++c) {
+            if (!is_numeric_col(c)) continue;
+            int_cols_[c].resize(base_row + n_rows);
+            for (size_t r = 0; r < n_rows; ++r)
+                int_cols_[c][base_row + r] = parse_int64(flat[r * (size_t)num_cols_ + c]);
+        }
         return "";
     }
 
@@ -201,6 +250,10 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
         for (int c = 0; c < num_cols_; ++c)
             rows_vals_.push_back(arena_.intern(row[c]));
         rows_meta_.push_back({expires_at, false});
+        // Populate native int64 columns
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c))
+                int_cols_[c].push_back(parse_int64(row[c]));
         pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
     }
     return "";
@@ -217,12 +270,16 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
         size_t est = std::max(n * 200UL, 1000000UL);
         rows_meta_.reserve(est);
         rows_vals_.reserve(est * (size_t)num_cols_);
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c)) int_cols_[c].reserve(est);
     } else {
         // Amortised growth: only reallocate when necessary
         if (rows_meta_.capacity() < rows_meta_.size() + n) {
             size_t new_cap = std::max(rows_meta_.size() * 2, rows_meta_.size() + n);
             rows_meta_.reserve(new_cap);
             rows_vals_.reserve(new_cap * (size_t)num_cols_);
+            for (int c = 0; c < num_cols_; ++c)
+                if (is_numeric_col(c)) int_cols_[c].reserve(new_cap);
         }
     }
 
@@ -245,6 +302,10 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
         for (auto sv : batch[r])
             rows_vals_.push_back(arena_.intern(sv));
         rows_meta_.push_back({expires_vec[r], false});
+        // Populate native int64 columns
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c))
+                int_cols_[c].push_back(parse_int64(batch[r][c]));
         if (schema_.pk_col_index >= 0)
             pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
     }
@@ -254,6 +315,51 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
 // ── Delete ────────────────────────────────────────────────────────────────────
 int Table::delete_rows(const Predicate* where) {
     std::unique_lock lock(mtx);
+
+    // PK fast path: equality (WHERE pk = X) → O(1) hash lookup
+    if (where && where->kind == Predicate::LEAF && where->op == "=" &&
+        schema_.pk_col_index >= 0) {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        if (col_name == schema_.columns[schema_.pk_col_index].name) {
+            long long pos = pk_index_.lookup(where->val);
+            if (pos >= 0) {
+                auto& m = rows_meta_[(size_t)pos];
+                if (!m.deleted && !is_expired(m)) {
+                    m.deleted = true;
+                    pk_index_.remove(where->val);
+                    return 1;
+                }
+            }
+            return 0;
+        }
+    }
+
+    // PK fast path: IN (WHERE pk IN (...)) → O(k) hash lookups
+    if (where && where->kind == Predicate::LEAF && where->op == "IN" &&
+        schema_.pk_col_index >= 0) {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        if (col_name == schema_.columns[schema_.pk_col_index].name) {
+            int count = 0;
+            for (const auto& v : where->in_vals) {
+                long long pos = pk_index_.lookup(v);
+                if (pos >= 0) {
+                    auto& m = rows_meta_[(size_t)pos];
+                    if (!m.deleted && !is_expired(m)) {
+                        m.deleted = true;
+                        pk_index_.remove(v);
+                        ++count;
+                    }
+                }
+            }
+            return count;
+        }
+    }
+
+    // General scan
     int count = 0;
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         auto& m = rows_meta_[i];
@@ -267,6 +373,136 @@ int Table::delete_rows(const Predicate* where) {
     }
     return count;
 }
+
+// ── AVX2 SIMD helpers for numeric column scanning ─────────────────────────────
+namespace {
+
+// Check whether row is alive (not deleted, not expired)
+struct AliveChecker {
+    const RowMeta* meta;
+    int64_t now;
+    bool operator()(size_t i) const {
+        return !meta[i].deleted && (meta[i].expires_at == 0 || meta[i].expires_at > now);
+    }
+};
+
+// AVX2 comparison scan: 4 × int64 per cycle.
+inline void avx2_filter_cmp(const int64_t* col, size_t n,
+                             const AliveChecker& alive,
+                             const std::string& op, int64_t target,
+                             std::vector<size_t>& out) {
+    const __m256i tgt = _mm256_set1_epi64x(target);
+    const __m256i ones = _mm256_set1_epi64x(-1LL);
+
+    size_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m256i vals = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col + i));
+        __m256i mask;
+        if      (op[0] == '=' && op.size() == 1)
+            mask = _mm256_cmpeq_epi64(vals, tgt);
+        else if (op == "!=")
+            mask = _mm256_andnot_si256(_mm256_cmpeq_epi64(vals, tgt), ones);
+        else if (op == ">")
+            mask = _mm256_cmpgt_epi64(vals, tgt);
+        else if (op == ">=")
+            mask = _mm256_or_si256(_mm256_cmpgt_epi64(vals, tgt),
+                                   _mm256_cmpeq_epi64(vals, tgt));
+        else if (op[0] == '<' && op.size() == 1)
+            mask = _mm256_cmpgt_epi64(tgt, vals);
+        else if (op == "<=")
+            mask = _mm256_or_si256(_mm256_cmpgt_epi64(tgt, vals),
+                                   _mm256_cmpeq_epi64(vals, tgt));
+        else return;
+
+        int m = _mm256_movemask_pd(_mm256_castsi256_pd(mask));
+        if (m & 1) if (alive(i))   out.push_back(i);
+        if (m & 2) if (alive(i+1)) out.push_back(i+1);
+        if (m & 4) if (alive(i+2)) out.push_back(i+2);
+        if (m & 8) if (alive(i+3)) out.push_back(i+3);
+    }
+    // Scalar tail
+    for (; i < n; ++i) {
+        if (!alive(i)) continue;
+        int64_t v = col[i];
+        bool hit = false;
+        if      (op[0] == '=' && op.size() == 1) hit = (v == target);
+        else if (op == "!=") hit = (v != target);
+        else if (op == ">")  hit = (v > target);
+        else if (op == ">=") hit = (v >= target);
+        else if (op[0] == '<' && op.size() == 1) hit = (v < target);
+        else if (op == "<=") hit = (v <= target);
+        if (hit) out.push_back(i);
+    }
+}
+
+// AVX2 BETWEEN scan
+inline void avx2_filter_between(const int64_t* col, size_t n,
+                                 const AliveChecker& alive,
+                                 int64_t lo, int64_t hi, bool negate,
+                                 std::vector<size_t>& out) {
+    const __m256i lo_v = _mm256_set1_epi64x(lo);
+    const __m256i hi_v = _mm256_set1_epi64x(hi);
+
+    size_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m256i vals = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col + i));
+        __m256i ge_lo = _mm256_or_si256(_mm256_cmpgt_epi64(vals, lo_v),
+                                        _mm256_cmpeq_epi64(vals, lo_v));
+        __m256i le_hi = _mm256_or_si256(_mm256_cmpgt_epi64(hi_v, vals),
+                                        _mm256_cmpeq_epi64(vals, hi_v));
+        __m256i mask = _mm256_and_si256(ge_lo, le_hi);
+        if (negate) {
+            __m256i ones = _mm256_set1_epi64x(-1LL);
+            mask = _mm256_andnot_si256(mask, ones);
+        }
+        int m = _mm256_movemask_pd(_mm256_castsi256_pd(mask));
+        if (m & 1) if (alive(i))   out.push_back(i);
+        if (m & 2) if (alive(i+1)) out.push_back(i+1);
+        if (m & 4) if (alive(i+2)) out.push_back(i+2);
+        if (m & 8) if (alive(i+3)) out.push_back(i+3);
+    }
+    for (; i < n; ++i) {
+        if (!alive(i)) continue;
+        int64_t v = col[i];
+        bool in_range = v >= lo && v <= hi;
+        if (negate ? !in_range : in_range) out.push_back(i);
+    }
+}
+
+// AVX2 IN scan
+inline void avx2_filter_in(const int64_t* col, size_t n,
+                             const AliveChecker& alive,
+                             const std::vector<int64_t>& targets, bool negate,
+                             std::vector<size_t>& out) {
+    size_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m256i vals = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(col + i));
+        __m256i mask = _mm256_setzero_si256();
+        for (int64_t t : targets) {
+            __m256i tv = _mm256_set1_epi64x(t);
+            mask = _mm256_or_si256(mask, _mm256_cmpeq_epi64(vals, tv));
+        }
+        if (negate) {
+            __m256i ones = _mm256_set1_epi64x(-1LL);
+            mask = _mm256_andnot_si256(mask, ones);
+        }
+        int m = _mm256_movemask_pd(_mm256_castsi256_pd(mask));
+        if (m & 1) if (alive(i))   out.push_back(i);
+        if (m & 2) if (alive(i+1)) out.push_back(i+1);
+        if (m & 4) if (alive(i+2)) out.push_back(i+2);
+        if (m & 8) if (alive(i+3)) out.push_back(i+3);
+    }
+    for (; i < n; ++i) {
+        if (!alive(i)) continue;
+        int64_t v = col[i];
+        bool found = false;
+        for (int64_t t : targets)
+            if (v == t) { found = true; break; }
+        if (negate ? !found : found) out.push_back(i);
+    }
+}
+
+} // anonymous namespace
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 QueryResult Table::scan(const std::vector<std::string>& select_cols,
@@ -315,13 +551,77 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
         }
     }
 
-    // General scan — collect matching row indices
+    // Fast path: PK IN lookup (WHERE pk IN (...)) → O(k) hash lookups
+    if (where && where->kind == Predicate::LEAF &&
+        (where->op == "IN" || where->op == "NOT IN") &&
+        schema_.pk_col_index >= 0) {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        if (col_name == schema_.columns[schema_.pk_col_index].name &&
+            where->op == "IN") {
+            QueryResult res;
+            res.column_names = out_names;
+            for (const auto& v : where->in_vals) {
+                long long pos = pk_index_.lookup(v);
+                if (pos >= 0) {
+                    size_t idx = (size_t)pos;
+                    if (!rows_meta_[idx].deleted && !is_expired(rows_meta_[idx]))
+                        res.rows.push_back(project(idx, col_indices));
+                }
+            }
+            return res;
+        }
+    }
+
+    // Collect matching row indices
     std::vector<size_t> row_idxs;
     row_idxs.reserve(rows_meta_.size());
-    for (size_t i = 0; i < rows_meta_.size(); ++i) {
-        if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-        if (where && !matches_pred(i, *where)) continue;
-        row_idxs.push_back(i);
+
+    // SIMD fast path: simple numeric LEAF predicate with int_cols_ available
+    bool used_simd = false;
+    if (where && where->kind == Predicate::LEAF &&
+        where->op != "IS NULL" && where->op != "IS NOT NULL" &&
+        where->op != "LIKE") {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        int pred_col = schema_.col_index(col_name);
+        if (pred_col >= 0 && is_numeric_col(pred_col) &&
+            pred_col < (int)int_cols_.size() && !int_cols_[pred_col].empty()) {
+            const int64_t* col_data = int_cols_[pred_col].data();
+            const size_t n = rows_meta_.size();
+            AliveChecker alive{rows_meta_.data(), (int64_t)std::time(nullptr)};
+
+            if (where->op == "BETWEEN" || where->op == "NOT BETWEEN") {
+                int64_t lo = parse_int64(where->val);
+                int64_t hi = parse_int64(where->val2);
+                avx2_filter_between(col_data, n, alive, lo, hi,
+                                    where->op == "NOT BETWEEN", row_idxs);
+                used_simd = true;
+            } else if (where->op == "IN" || where->op == "NOT IN") {
+                std::vector<int64_t> targets;
+                targets.reserve(where->in_vals.size());
+                for (const auto& v : where->in_vals)
+                    targets.push_back(parse_int64(v));
+                avx2_filter_in(col_data, n, alive, targets,
+                               where->op == "NOT IN", row_idxs);
+                used_simd = true;
+            } else {
+                int64_t target = parse_int64(where->val);
+                avx2_filter_cmp(col_data, n, alive, where->op, target, row_idxs);
+                used_simd = true;
+            }
+        }
+    }
+
+    // General scan fallback
+    if (!used_simd) {
+        for (size_t i = 0; i < rows_meta_.size(); ++i) {
+            if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
+            if (where && !matches_pred(i, *where)) continue;
+            row_idxs.push_back(i);
+        }
     }
 
     // ORDER BY — multi-column stable sort (rightmost key applied first)
@@ -342,19 +642,26 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
         // Apply keys right-to-left so leftmost key dominates
         for (int ki = (int)keys.size() - 1; ki >= 0; --ki) {
             const auto& k = keys[ki];
+            // Use int_cols_ for numeric sort (avoids stod per comparison)
+            const bool use_int = k.numeric && k.col_idx < (int)int_cols_.size() &&
+                                 !int_cols_[k.col_idx].empty();
             std::stable_sort(row_idxs.begin(), row_idxs.end(),
                 [&](size_t a, size_t b) {
-                    std::string_view va = val_at(a, k.col_idx);
-                    std::string_view vb = val_at(b, k.col_idx);
                     bool less_than;
-                    if (k.numeric) {
+                    if (use_int) {
+                        int64_t va = int_cols_[k.col_idx][a];
+                        int64_t vb = int_cols_[k.col_idx][b];
+                        less_than = va < vb;
+                    } else if (k.numeric) {
+                        std::string_view sva = val_at(a, k.col_idx);
+                        std::string_view svb = val_at(b, k.col_idx);
                         try {
-                            less_than = std::stod(std::string(va)) < std::stod(std::string(vb));
+                            less_than = std::stod(std::string(sva)) < std::stod(std::string(svb));
                         } catch (...) {
-                            less_than = va < vb;
+                            less_than = sva < svb;
                         }
                     } else {
-                        less_than = va < vb;
+                        less_than = val_at(a, k.col_idx) < val_at(b, k.col_idx);
                     }
                     return k.desc ? !less_than : less_than;
                 });
@@ -393,15 +700,64 @@ Table::live_rows() const {
 int Table::update_rows(const std::vector<std::pair<std::string,std::string>>& assignments,
                        const Predicate* where) {
     std::unique_lock lock(mtx);
+
+    // Helper: apply assignments to a single row
+    auto apply = [&](size_t i) {
+        for (const auto& [col, val] : assignments) {
+            int idx = schema_.col_index(col);
+            if (idx >= 0 && idx < num_cols_) {
+                val_ref(i, idx) = arena_.intern(val);
+                // Update native int64 column
+                if (is_numeric_col(idx) && idx < (int)int_cols_.size() &&
+                    !int_cols_[idx].empty())
+                    int_cols_[idx][i] = parse_int64(val);
+            }
+        }
+    };
+
+    // PK fast path: equality (WHERE pk = X) → O(1) hash lookup
+    if (where && where->kind == Predicate::LEAF && where->op == "=" &&
+        schema_.pk_col_index >= 0) {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        if (col_name == schema_.columns[schema_.pk_col_index].name) {
+            long long pos = pk_index_.lookup(where->val);
+            if (pos >= 0 && !rows_meta_[(size_t)pos].deleted &&
+                !is_expired(rows_meta_[(size_t)pos])) {
+                apply((size_t)pos);
+                return 1;
+            }
+            return 0;
+        }
+    }
+
+    // PK fast path: IN (WHERE pk IN (...)) → O(k) hash lookups
+    if (where && where->kind == Predicate::LEAF && where->op == "IN" &&
+        schema_.pk_col_index >= 0) {
+        std::string col_name = where->col;
+        size_t dot = col_name.find('.');
+        if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
+        if (col_name == schema_.columns[schema_.pk_col_index].name) {
+            int count = 0;
+            for (const auto& v : where->in_vals) {
+                long long pos = pk_index_.lookup(v);
+                if (pos >= 0 && !rows_meta_[(size_t)pos].deleted &&
+                    !is_expired(rows_meta_[(size_t)pos])) {
+                    apply((size_t)pos);
+                    ++count;
+                }
+            }
+            return count;
+        }
+    }
+
+    // General scan
     int count = 0;
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
         if (where && !matches_pred(i, *where)) continue;
-        for (const auto& [col, val] : assignments) {
-            int idx = schema_.col_index(col);
-            if (idx >= 0 && idx < num_cols_)
-                val_ref(i, idx) = arena_.intern(val);
-        }
+        apply(i);
         ++count;
     }
     return count;
@@ -414,6 +770,7 @@ void Table::truncate() {
     rows_vals_.clear();
     arena_.clear();
     pk_index_.clear();
+    for (auto& ic : int_cols_) ic.clear();
 }
 
 // ── Snapshot rows (for persistence) ──────────────────────────────────────────
@@ -441,8 +798,11 @@ void Table::compact() {
     StringArena new_arena;
     std::vector<RowMeta>          new_meta;
     std::vector<std::string_view> new_vals;
+    std::vector<std::vector<int64_t>> new_int_cols((size_t)num_cols_);
     new_meta.reserve(rows_meta_.size());
     new_vals.reserve(rows_vals_.size());
+    for (int c = 0; c < num_cols_; ++c)
+        if (is_numeric_col(c)) new_int_cols[c].reserve(rows_meta_.size());
     pk_index_.clear();
 
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
@@ -451,6 +811,10 @@ void Table::compact() {
         for (int c = 0; c < num_cols_; ++c)
             new_vals.push_back(new_arena.intern(val_at(i, c)));
         new_meta.push_back(rows_meta_[i]);
+        // Rebuild int_cols_
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c) && !int_cols_[c].empty())
+                new_int_cols[c].push_back(int_cols_[c][i]);
         if (schema_.pk_col_index >= 0)
             pk_index_.insert(new_vals[new_idx * (size_t)num_cols_ +
                                       (size_t)schema_.pk_col_index],
@@ -460,4 +824,5 @@ void Table::compact() {
     arena_     = std::move(new_arena);
     rows_meta_ = std::move(new_meta);
     rows_vals_ = std::move(new_vals);
+    int_cols_  = std::move(new_int_cols);
 }
