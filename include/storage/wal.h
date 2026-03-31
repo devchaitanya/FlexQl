@@ -30,11 +30,14 @@ public:
 
     // Append a SQL statement to the WAL.
     // Returns the LSN assigned to this record (monotonically increasing).
-    // Thread-safe; uses group-commit buffering.
+    // Thread-safe; each call makes one writev() syscall.
     uint64_t append(std::string_view sql);
 
     // Force all buffered records to disk (fdatasync).
     void sync();
+
+    // Truncate WAL file to 0 bytes (called after a snapshot is written).
+    void truncate();
 
     uint64_t next_lsn() const { return next_lsn_; }
     uint64_t durable_lsn() const { return durable_lsn_; }

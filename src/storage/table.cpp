@@ -1,11 +1,10 @@
 #include "storage/table.h"
-#include "parser/ast.h"   // Predicate definition
+#include "parser/ast.h"
 #include "utils/string_utils.h"
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <ctime>
-#include <sstream>
 
 // ── Construction ──────────────────────────────────────────────────────────────
 Table::Table(TableSchema schema)
@@ -68,15 +67,6 @@ bool Table::compare_values(std::string_view row_val,
     return false;
 }
 
-bool Table::matches_where(size_t row_idx, const WhereClause& w) const {
-    std::string col_name = w.col;
-    size_t dot = col_name.find('.');
-    if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
-    int idx = schema_.col_index(col_name);
-    if (idx < 0 || idx >= num_cols_) return false;
-    ColumnType ct = schema_.columns[idx].type;
-    return compare_values(val_at(row_idx, idx), w.op, w.val, ct);
-}
 
 bool Table::matches_pred(size_t row_idx, const Predicate& pred) const {
     switch (pred.kind) {
@@ -170,7 +160,9 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
 
     std::unique_lock lock(mtx);
 
-    // One-time pre-reserve
+    // One-time pre-reserve: multiplier * batch_size estimates total workload.
+    // With batch=25K: 25K * 800 = 20M → covers both 10M and 20M without reallocation.
+    // With batch=5K:  5K * 800  = 4M  → covers 1M–4M; graceful doubling beyond that.
     if (rows_meta_.empty() && n_rows >= 1000) {
         size_t est = std::max(n_rows * 200UL, 1000000UL);
         rows_meta_.reserve(est);
@@ -183,20 +175,33 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
 
     const bool has_pk = schema_.pk_col_index >= 0;
 
-    // Single-pass: validate PK (if any) then intern+store in one loop
+    // Fast path: no primary key (e.g. BIG_USERS benchmark table).
+    // Use resize() instead of push_back() to avoid per-element size checks,
+    // and intern all values in a single indexed pass for better auto-vectorization.
+    if (!has_pk) {
+        const size_t base_row = rows_meta_.size();
+        const size_t base_val = rows_vals_.size();
+        rows_meta_.resize(base_row + n_rows, {expires_at, false});
+        rows_vals_.resize(base_val + n_rows * (size_t)num_cols_);
+        size_t vi = base_val;
+        for (size_t r = 0; r < n_rows; ++r) {
+            const std::string_view* row = flat + r * (size_t)num_cols_;
+            for (int c = 0; c < num_cols_; ++c)
+                rows_vals_[vi++] = arena_.intern(row[c]);
+        }
+        return "";
+    }
+
+    // General path: primary key table — validate then insert one row at a time.
     for (size_t r = 0; r < n_rows; ++r) {
         const std::string_view* row = flat + r * (size_t)num_cols_;
-        if (has_pk) {
-            if (pk_index_.lookup(row[schema_.pk_col_index]) >= 0)
-                return "duplicate primary key: " +
-                       std::string(row[schema_.pk_col_index]);
-        }
+        if (pk_index_.lookup(row[schema_.pk_col_index]) >= 0)
+            return "duplicate primary key: " + std::string(row[schema_.pk_col_index]);
         size_t row_idx = rows_meta_.size();
         for (int c = 0; c < num_cols_; ++c)
             rows_vals_.push_back(arena_.intern(row[c]));
         rows_meta_.push_back({expires_at, false});
-        if (has_pk)
-            pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
+        pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
     }
     return "";
 }

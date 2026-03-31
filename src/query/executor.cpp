@@ -9,7 +9,6 @@
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
-#include <ctime>
 
 // ── Global LRU query cache ────────────────────────────────────────────────────
 static LRUCache<std::string, QueryResult> g_cache(1024);
@@ -316,13 +315,7 @@ QueryResult Executor::exec_group_by(const SelectStmt& s) {
         if (lp != std::string::npos) {
             std::string fn  = strutil::to_upper(c.substr(0, lp));
             std::string arg = c.substr(lp + 1, c.size() - lp - 2); // strip ()
-            int cidx = -1;
-            if (arg != "*") {
-                for (int i = 0; i < (int)base.column_names.size(); ++i)
-                    if (strutil::iequals(base.column_names[i], arg)) { cidx = i; break; }
-            }
             aggs.push_back({fn, arg, (int)out_names.size()});
-            (void)cidx;
             out_names.push_back(c);
         } else {
             // Regular column — must be a group-by column
@@ -568,7 +561,7 @@ QueryResult Executor::exec_join(const SelectStmt& s) {
     };
 
     // Probe phase
-    std::vector<bool> b_matched(rows_b.size(), false); // for LEFT JOIN unmatched tracking
+    std::vector<bool> a_matched(rows_a.size(), false); // track matched left-table rows for LEFT JOIN
     for (size_t bi = 0; bi < rows_b.size(); ++bi) {
         const auto& vals_b = rows_b[bi].first;
         if (col_b >= (int)vals_b.size()) continue;
@@ -577,7 +570,7 @@ QueryResult Executor::exec_join(const SelectStmt& s) {
         for (auto it = range.first; it != range.second; ++it) {
             const auto& vals_a = rows_a[it->second].first;
             if (!eval_where(vals_a, vals_b)) continue;
-            b_matched[bi] = true;
+            a_matched[it->second] = true;
             std::vector<std::string> out_row;
             out_row.reserve(out_a_idx.size());
             for (size_t k = 0; k < out_a_idx.size(); ++k) {
@@ -589,15 +582,15 @@ QueryResult Executor::exec_join(const SelectStmt& s) {
         }
     }
 
-    // LEFT JOIN: emit unmatched right-side rows with NULLs on left
+    // LEFT JOIN: emit unmatched left-side (rows_a) rows with NULLs for right columns
     if (s.left_join && !swapped) {
-        for (size_t bi = 0; bi < rows_b.size(); ++bi) {
-            if (b_matched[bi]) continue;
-            const auto& vals_b = rows_b[bi].first;
+        for (size_t ai = 0; ai < rows_a.size(); ++ai) {
+            if (a_matched[ai]) continue;
+            const auto& vals_a = rows_a[ai].first;
             std::vector<std::string> out_row(out_a_idx.size(), "");
-            for (size_t k = 0; k < out_b_idx.size(); ++k)
-                if (out_b_idx[k] >= 0 && out_b_idx[k] < (int)vals_b.size())
-                    out_row[k] = vals_b[out_b_idx[k]];
+            for (size_t k = 0; k < out_a_idx.size(); ++k)
+                if (out_a_idx[k] >= 0 && out_a_idx[k] < (int)vals_a.size())
+                    out_row[k] = vals_a[out_a_idx[k]];
             res.rows.push_back(std::move(out_row));
         }
     }

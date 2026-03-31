@@ -37,17 +37,22 @@ make all -j$(nproc)
 ```
 
 ```
-Connected to FlexQL server
+Connected to FlexQL server at 127.0.0.1:9000
 flexql> CREATE TABLE STUDENT (ID INT PRIMARY KEY NOT NULL, NAME TEXT NOT NULL);
+Query OK (0.001 sec)
 flexql> INSERT INTO STUDENT VALUES (1, 'Alice', 1900000000);
-flexql> INSERT INTO STUDENT VALUES (2, 'Bob',   1900000000);
+Query OK (0.000 sec)
+flexql> INSERT INTO STUDENT VALUES (2, 'Bob', 1900000000);
+Query OK (0.000 sec)
 flexql> SELECT * FROM STUDENT WHERE ID >= 1 ORDER BY NAME DESC;
-ID = 2
-NAME = Bob
 
-ID = 1
-NAME = Alice
-
++----+-------+
+| ID | NAME  |
++----+-------+
+| 2  | Bob   |
+| 1  | Alice |
++----+-------+
+2 rows in set (0.000 sec)
 flexql> .exit
 Connection closed
 ```
@@ -134,7 +139,7 @@ rows_meta_[i]         →  RowMeta { int64_t expires_at; bool deleted; }
 rows_vals_[i*ncols+c] →  string_view into StringArena (stable pointer)
 ```
 
-All string content lives in a `StringArena` — a bump-pointer slab allocator (512 KB slabs) that never moves memory. `insert_flat()` is the hot path: it takes a flat array of `string_view`s pointing directly into the received SQL buffer, computes CRC32c for WAL, calls `writev(header, sql)`, then interns each value into the arena in a single pass.
+All string content lives in a `StringArena` — a bump-pointer slab allocator (4 MB slabs) that never moves memory. `insert_flat()` is the hot path: it takes a flat array of `string_view`s pointing directly into the received SQL buffer, computes CRC32c for WAL, calls `writev(header, sql)`, then interns each value into the arena in a single pass.
 
 **Why columnar over `vector<Row>`?**
 Eliminates 1M per-row `vector<string>` heap allocations for a 1M-row insert. All 3M string_views for a 1M×3-col table live in one contiguous pre-allocated array — cache-line friendly sequential access during scan.
@@ -432,21 +437,31 @@ Server output on startup:
 # Start server in one terminal
 ./bin/flexql-server 9000
 
-# Run 1M-row INSERT benchmark + 22 unit tests in another terminal
+# Run 1M-row INSERT benchmark in another terminal
 ./bench/benchmark 1000000
+
+# Or run with a custom row count
+./bench/benchmark 10000000   # 10M rows
+./bench/benchmark 20000000   # 20M rows
 ```
 
 Expected output:
 ```
+Connected to FlexQL
+Running SQL subset checks plus insertion benchmark...
+Target insert rows: 1000000
+
+[PASS] DROP TABLE BIG_USERS (if exists) (0 ms)
 [PASS] CREATE TABLE BIG_USERS (0 ms)
+
 Starting insertion benchmark for 1000000 rows...
+Progress: 100000/1000000
 ...
+Progress: 1000000/1000000
 [PASS] INSERT benchmark complete
 Rows inserted: 1000000
-Elapsed: ~600 ms
-Throughput: ~1,600,000 rows/sec
-
-Unit Test Summary: 22/22 passed, 0 failed.
+Elapsed: 334 ms
+Throughput: 2994011 rows/sec
 ```
 
 ---
@@ -460,24 +475,35 @@ Unit Test Summary: 22/22 passed, 0 failed.
 | Parser | `fast_parse_insert()` — single-pass char scanner, no tokenizer | Eliminates 65K Token objects per batch |
 | AST | Flat `string_view` layout — one `vector<string_view>` per batch | Eliminates 5K inner-vector heap allocs per batch |
 | Storage | `insert_flat()` — single lock, single pass validate+intern+store | No per-row allocation |
-| Arena | `StringArena` bump-pointer, 512KB slabs, `current_` pointer cache | ~10ns per string intern |
+| Arena | `StringArena` bump-pointer, 4 MB slabs, `current_` pointer cache | ~10ns per string intern |
 | PK index | FNV-64 flat open-addressing hash map | No linked-node allocations |
 | WAL | `writev(header_on_stack, sql_buf)` — zero memcpy | +~55ms over RAM-only |
 | WAL CRC | SSE4.2 `_mm_crc32_u64` hardware instruction | 9ms vs 166ms software for 200 batches |
 | Network | `TCP_NODELAY` on client sockets | No Nagle buffering delay |
 | Compiler | `-O3 -march=native` | Auto-vectorisation of arena memcpy |
 
-### Measured results (i5-1135G7, thermal-throttled)
+### Measured Results (i5-1135G7 @ 2.40 GHz, 14 GB RAM)
 
-| Configuration | Elapsed | Throughput |
+**INSERT throughput — batch size 25,000:**
+
+| Dataset | Elapsed | Throughput |
 |---|---|---|
-| RAM-only (no WAL) | ~570 ms | ~1,750,000 rows/sec |
-| With WAL (current) | ~620 ms | ~1,600,000 rows/sec |
-| WAL overhead | ~50 ms | — |
+| 1M rows | 264 ms | 3,787,878 rows/sec |
+| 10M rows | 2,748 ms | 3,639,010 rows/sec |
 
-WAL adds only ~50ms because writes go to the kernel page cache (no `fdatasync` in the hot path). Data is safe against process crashes; the trade-off is that an OS crash could lose the last few un-fsynced records.
+**INSERT throughput — batch size 5,000:**
 
-### SELECT performance
+| Dataset | Elapsed | Throughput |
+|---|---|---|
+| 1M rows | 334 ms | 2,994,011 rows/sec |
+| 10M rows | 3,065 ms | 3,262,642 rows/sec |
+| 20M rows | 6,385 ms | 3,132,341 rows/sec |
+
+Larger batches reduce TCP round-trips and lock acquisitions, yielding ~10–21% higher throughput. Throughput degrades slightly at scale due to hash-table rehashing and memory pressure.
+
+WAL adds only ~50ms per 1M rows because writes go to the kernel page cache (no `fdatasync` in the hot path). Data is safe against process crashes; the trade-off is that an OS crash could lose the last few un-fsynced records.
+
+### SELECT Performance
 
 | Query type | Mechanism | Complexity |
 |---|---|---|

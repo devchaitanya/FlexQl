@@ -5,8 +5,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
-#include <cerrno>
-#include <stdexcept>
 #include <filesystem>
 #include <nmmintrin.h>  // SSE4.2 _mm_crc32_u64/_mm_crc32_u8
 
@@ -19,7 +17,6 @@ static uint32_t compute_crc32c(const void* data, size_t len) noexcept {
     const uint8_t* p   = static_cast<const uint8_t*>(data);
     uint64_t       crc = 0xFFFFFFFFu;
 
-    // Process 8 bytes at a time
     const uint8_t* end8 = p + (len & ~(size_t)7);
     while (p < end8) {
         uint64_t v;
@@ -27,7 +24,6 @@ static uint32_t compute_crc32c(const void* data, size_t len) noexcept {
         crc = _mm_crc32_u64(crc, v);
         p += 8;
     }
-    // Remaining bytes
     size_t tail = len & 7;
     while (tail--) crc = _mm_crc32_u8((uint32_t)crc, *p++);
 
@@ -52,7 +48,6 @@ WalWriter::~WalWriter() {
 }
 
 bool WalWriter::open(const std::string& path) {
-    // Ensure parent directory exists
     try {
         std::filesystem::create_directories(
             std::filesystem::path(path).parent_path());
@@ -62,7 +57,7 @@ bool WalWriter::open(const std::string& path) {
     if (fd_ < 0) return false;
 
     // Derive next_lsn_ by scanning existing records so we don't reuse LSNs
-    // after a restart.  Use a temporary reader for this.
+    // after a restart.
     WalReader rd;
     if (rd.open(path)) {
         uint64_t lsn; std::string sql;
@@ -74,7 +69,7 @@ bool WalWriter::open(const std::string& path) {
 }
 
 uint64_t WalWriter::append(std::string_view sql) {
-    // Header: magic(4) + lsn(8) + payload_len(4) + crc32(4) = 20 bytes
+    // Header layout: magic(4) + lsn(8) + payload_len(4) + crc32c(4) = 20 bytes
     const uint32_t payload_len = static_cast<uint32_t>(sql.size());
     const uint32_t checksum    = crc32c(sql.data(), sql.size());
 
@@ -95,7 +90,6 @@ uint64_t WalWriter::append(std::string_view sql) {
     le32(hdr+16, checksum);
 
     // Zero-copy: write header + SQL payload in one atomic writev() call.
-    // No group-commit buffer — avoids 275KB memcpy per batch that pollutes L3.
     // O_APPEND guarantees atomic positioning; mutex ensures single writer.
     if (fd_ >= 0) {
         struct iovec iov[2];
@@ -114,6 +108,17 @@ uint64_t WalWriter::append(std::string_view sql) {
 void WalWriter::sync() {
     std::lock_guard<std::mutex> guard(mtx_);
     if (fd_ >= 0) ::fdatasync(fd_);
+}
+
+void WalWriter::truncate() {
+    std::lock_guard<std::mutex> guard(mtx_);
+    if (fd_ >= 0) {
+        ::fdatasync(fd_);
+        int _r = ::ftruncate(fd_, 0); (void)_r;
+        ::lseek(fd_, 0, SEEK_SET);
+        next_lsn_    = 1;
+        durable_lsn_ = 0;
+    }
 }
 
 // ── WalReader ─────────────────────────────────────────────────────────────────
@@ -150,17 +155,15 @@ bool WalReader::read_next(uint64_t& lsn_out, std::string& sql_out) {
 
     uint64_t lsn;
     uint32_t payload_len, checksum;
-    if (!read_u64(lsn))       return false;
+    if (!read_u64(lsn))        return false;
     if (!read_u32(payload_len)) return false;
-    if (!read_u32(checksum))  return false;
+    if (!read_u32(checksum))   return false;
 
     std::string sql(payload_len, '\0');
     if (!file_.read(sql.data(), payload_len)) return false;
 
-    uint32_t computed = crc32c(sql.data(), payload_len);
-    if (computed != checksum) {
-        // CRC mismatch: record is corrupt — stop recovery here to avoid
-        // applying partial/corrupt state.
+    if (crc32c(sql.data(), payload_len) != checksum) {
+        // CRC mismatch: record is corrupt — stop recovery here.
         return false;
     }
 

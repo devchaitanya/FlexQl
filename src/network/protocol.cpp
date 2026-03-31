@@ -2,7 +2,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <cstring>
-#include <sstream>
 
 namespace protocol {
 
@@ -13,16 +12,32 @@ std::string encode_response(const QueryResult& res) {
     if (res.column_names.empty())
         return "OK\nEND\n";
 
+    const int ncols = (int)res.column_names.size();
     std::string out;
-    // Column names header (parsed by our client; ignored by bench which only reads ROW lines)
+    out.reserve(res.rows.size() * ncols * 24 + 32);
+
+    // COLS header: kept for our REPL client (used when result set is empty);
+    // the official benchmark client ignores unrecognised lines.
     out += "COLS";
     for (const auto& col : res.column_names) { out += ' '; out += col; }
     out += '\n';
+
+    // ROW lines: official length-prefixed format
+    //   ROW <N> <len>:<col_name><len>:<col_val>...\n
+    // This is what the official benchmark flexql.cpp parses via parse_row_payload().
+    char numbuf[24];
     for (const auto& row : res.rows) {
-        out += "ROW";
-        for (const auto& v : row) {
-            out += ' ';
-            out += v;
+        out += "ROW ";
+        int n = snprintf(numbuf, sizeof(numbuf), "%d", ncols);
+        out.append(numbuf, n);
+        out += ' ';
+        for (int i = 0; i < ncols; ++i) {
+            const std::string& name = res.column_names[i];
+            const std::string& val  = (i < (int)row.size()) ? row[i] : "";
+            n = snprintf(numbuf, sizeof(numbuf), "%zu", name.size());
+            out.append(numbuf, n); out += ':'; out += name;
+            n = snprintf(numbuf, sizeof(numbuf), "%zu", val.size());
+            out.append(numbuf, n); out += ':'; out += val;
         }
         out += '\n';
     }
@@ -41,16 +56,23 @@ bool send_all(int fd, const std::string& msg) {
 }
 
 std::string recv_sql(int fd) {
-    // Read raw SQL terminated by ';' (reference protocol).
-    // Use a large recv buffer to minimize syscalls; check only the last byte
-    // received (benchmark SQL always ends with exactly one ';').
-    std::string sql;
-    sql.reserve(512 * 1024); // pre-reserve for large INSERT batches
-    char buf[65536];
+    // Thread-local recv buffer: avoids 2MB heap alloc/dealloc per request.
+    // Safe: each worker thread has its own instance.
+    static thread_local std::string sql;
+    sql.clear();
+    if (sql.capacity() < 2 * 1024 * 1024)
+        sql.reserve(2 * 1024 * 1024);
+
+    // Maximum SQL message size (16 MB) to prevent OOM from malicious clients
+    static constexpr size_t MAX_SQL_SIZE = 16 * 1024 * 1024;
+
+    // 256 KB recv buffer — cuts syscall count from ~22 to ~6 per 1.4MB batch.
+    static thread_local char buf[256 * 1024];
     while (true) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return ""; // disconnected or error
         sql.append(buf, n);
+        if (sql.size() > MAX_SQL_SIZE) return ""; // reject oversized messages
         if (sql.back() == ';')
             return sql;
     }

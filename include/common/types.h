@@ -6,15 +6,6 @@
 // ── Column types ────────────────────────────────────────────────────────────
 enum class ColumnType { INT, DECIMAL, VARCHAR, TEXT, DATETIME };
 
-inline ColumnType parse_column_type(const std::string& s) {
-    if (s == "INT")      return ColumnType::INT;
-    if (s == "DECIMAL")  return ColumnType::DECIMAL;
-    if (s == "VARCHAR")  return ColumnType::VARCHAR;
-    if (s == "TEXT")     return ColumnType::TEXT;
-    if (s == "DATETIME") return ColumnType::DATETIME;
-    return ColumnType::TEXT; // fallback
-}
-
 // ── Column definition (from CREATE TABLE) ───────────────────────────────────
 struct ColumnDef {
     std::string name;

@@ -55,13 +55,21 @@ public:
         uint64_t h    = fnv64(key);
         size_t   mask = capacity_ - 1;
         size_t   pos  = h & mask;
+        size_t   first_tombstone = SIZE_MAX;
 
-        while (slots_[pos].occupied && !slots_[pos].tombstone) {
-            if (slots_[pos].hash == h && slots_[pos].key == key)
+        // Scan past ALL occupied slots (including tombstones) to detect duplicates.
+        // Record first tombstone position for reuse.
+        while (slots_[pos].occupied) {
+            if (slots_[pos].tombstone) {
+                if (first_tombstone == SIZE_MAX)
+                    first_tombstone = pos;
+            } else if (slots_[pos].hash == h && slots_[pos].key == key) {
                 return false; // duplicate
+            }
             pos = (pos + 1) & mask;
         }
-        slots_[pos] = {h, key, row_idx, true, false};
+        size_t insert_pos = (first_tombstone != SIZE_MAX) ? first_tombstone : pos;
+        slots_[insert_pos] = {h, key, row_idx, true, false};
         ++count_;
         return true;
     }
@@ -97,6 +105,8 @@ public:
         }
     }
 
+    void   clear()  { slots_.clear(); count_ = 0; capacity_ = 0; }
+
     // Update row_idx after compaction (key stays in arena, same pointer).
     void update(std::string_view key, size_t new_idx) {
         if (capacity_ == 0) return;
@@ -113,6 +123,5 @@ public:
         }
     }
 
-    void   clear()  { slots_.clear(); count_ = 0; capacity_ = 0; }
     size_t size()   const { return count_; }
 };

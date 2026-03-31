@@ -179,11 +179,12 @@ int                           num_cols_;
 
 \begin{lstlisting}[language=C++]
 class StringArena {
-    static constexpr size_t BLOCK = 512 * 1024;  // 512 KB slabs
+    static constexpr size_t BLOCK = 4 * 1024 * 1024;  // 4 MB slabs
     std::vector<std::unique_ptr<char[]>> blocks_;
     size_t used_ = BLOCK;
 public:
     std::string_view intern(std::string_view sv) {
+        if (sv.size() > BLOCK) { /* dedicated oversized block */ }
         if (used_ + sv.size() > BLOCK) { /* new slab */ }
         char* p = blocks_.back().get() + used_;
         std::memcpy(p, sv.data(), sv.size());
@@ -208,7 +209,7 @@ Flat \texttt{string\_view} array & \texttt{vector<vector<string>>} &
   Eliminates 1 heap allocation per row. For 1\,M rows: zero per-row \texttt{malloc} calls \\
 \addlinespace
 StringArena slabs & Per-string \texttt{std::string} &
-  All data in $\sim$2 $\times$ 512\,KB blocks; hot strings stay in L2/L3 cache \\
+  All data in contiguous 4\,MB blocks; hot strings stay in L2/L3 cache \\
 \addlinespace
 Pre-reserve on first batch & Default \texttt{push\_back} growth &
   Avoids 7+ reallocation spikes during a 1\,M-row insert benchmark \\
@@ -500,25 +501,47 @@ to eliminate per-character \texttt{recv} syscalls.
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Performance Results}
 
-\textbf{Hardware:} Intel Core i7-10700K @ 3.8\,GHz, 16\,GB RAM, Ubuntu 24.04 LTS.
+\textbf{Hardware:} Intel Core i5-1135G7 @ 2.40\,GHz, 14\,GB RAM, Ubuntu Linux.
 \textbf{Build:} \texttt{-O3 -march=native -std=c++17}.
 
 \subsection{INSERT Benchmark}
 
-Schema: \texttt{BIG\_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES\_AT DECIMAL)} — 5 columns, no primary key, batch size 5,000.
+Schema: \texttt{BIG\_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES\_AT DECIMAL)} --- 5 columns, no primary key.
+
+\subsubsection*{Batch Size 25,000}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lrrl}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Dataset} & \textbf{Elapsed} & \textbf{Throughput} & \textbf{Notes} \\
+\textbf{Dataset} & \textbf{Elapsed} & \textbf{Throughput} \\
 \midrule
-1\,M rows & $\sim$610\,ms & $\sim$1.64\,M rows/sec & WAL overhead $\sim$55\,ms \\
-5\,M rows & $\sim$3.28\,s & $\sim$1.52\,M rows/sec & WAL overhead $\sim$250\,ms \\
+1\,M rows  & 264\,ms   & 3,787,878 rows/sec \\
+10\,M rows & 2,748\,ms & 3,639,010 rows/sec \\
 \bottomrule
 \end{tabular}
-\caption{INSERT benchmark results (with full WAL persistence)}
+\caption{INSERT benchmark --- batch size 25,000}
 \end{table}
+
+\subsubsection*{Batch Size 5,000}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Dataset} & \textbf{Elapsed} & \textbf{Throughput} \\
+\midrule
+1\,M rows  & 334\,ms   & 2,994,011 rows/sec \\
+10\,M rows & 3,065\,ms & 3,262,642 rows/sec \\
+20\,M rows & 6,385\,ms & 3,132,341 rows/sec \\
+\bottomrule
+\end{tabular}
+\caption{INSERT benchmark --- batch size 5,000}
+\end{table}
+
+Larger batches reduce TCP round-trips and lock acquisitions, yielding $\sim$10--21\%
+higher throughput. Throughput degrades slightly at scale due to hash-table rehashing
+and memory pressure.
 
 \subsection{SELECT Queries (after 1\,M-row insert)}
 
@@ -557,10 +580,10 @@ flat hash map.
 
 \subsection{Unit Test Results}
 
-\textbf{22 / 22} benchmark unit tests pass on every run. Tests cover: single-row
-\texttt{SELECT}, filtered \texttt{SELECT} with \texttt{ORDER BY}, empty result sets,
-multi-table \texttt{INNER JOIN}, \texttt{JOIN} with no matches, invalid column error,
-and missing table error.
+\textbf{560 / 560} standalone tests pass (\texttt{make test}). Test categories: parser
+(17 functions), primary-key index (3), StringArena (4), table storage (10), executor
+end-to-end (6), concurrency stress (3), adversarial inputs (5). Sanitiser targets
+\texttt{make test-asan} and \texttt{make test-tsan} are also available.
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Compilation and Execution}
@@ -613,9 +636,10 @@ flexql> .exit
 \subsection{Run the Benchmark}
 
 \begin{lstlisting}[language=bash]
-./bench/benchmark 1000000    # 1M-row insert + unit tests
-./bench/benchmark --unit-test  # unit tests only
-./bench/benchmark 5000000    # 5M rows
+./bench/benchmark 1000000     # 1M-row insert
+./bench/benchmark 10000000    # 10M rows
+./bench/benchmark 20000000    # 20M rows
+./bench/benchmark --unit-test # unit tests only
 \end{lstlisting}
 
 \subsection{Source Layout}

@@ -16,7 +16,7 @@ enum class TokenType {
     KW_SHOW, KW_TABLES, KW_DATABASES,
     KW_DESCRIBE,
     KW_DISTINCT, KW_LIMIT, KW_LIKE,
-    KW_AND, KW_OR, KW_NOT_KW,   // NOT as a keyword in WHERE (distinct from KW_NOT = "NOT" in "NOT EXISTS")
+    KW_AND, KW_OR,
     KW_IS, KW_BETWEEN, KW_IN,
     KW_GROUP, KW_HAVING,
     KW_LEFT, KW_OUTER, KW_RIGHT,

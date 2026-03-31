@@ -19,11 +19,11 @@ private:
     explicit Parser(std::vector<Token> tokens);
 
     Statement        parse_stmt();
-    CreateTableStmt  parse_create();
+    Statement        parse_create();
     InsertStmt       parse_insert();
     SelectStmt       parse_select();
     DeleteStmt       parse_delete();
-    DropTableStmt    parse_drop();
+    Statement        parse_drop();
     Statement        parse_show();
     DescribeStmt     parse_describe();
     UpdateStmt       parse_update();

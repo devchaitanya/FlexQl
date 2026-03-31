@@ -64,7 +64,7 @@ static std::optional<InsertStmt> fast_parse_insert(const std::string& sql) {
     }
 
     if (!match_kw("VALUES")) return std::nullopt;
-    stmt.flat_values.reserve(5 * 5000);
+    stmt.flat_values.reserve(5 * 25000); // 125K for 25K rows × 5 cols
 
     int first_row_ncols = 0;
     bool first_row = true;
@@ -181,10 +181,19 @@ Statement Parser::parse_stmt() {
     throw ParseError("unknown statement starting with '" + t.value + "'");
 }
 
-// ── CREATE TABLE [IF NOT EXISTS] name ( col_def, ... ) ───────────────────────
-CreateTableStmt Parser::parse_create() {
+// ── CREATE TABLE | CREATE DATABASE ───────────────────────────────────────────
+Statement Parser::parse_create() {
     expect(TokenType::KW_CREATE, "CREATE");
-    expect(TokenType::KW_TABLE,  "TABLE");
+    // CREATE DATABASE [IF NOT EXISTS] name  — single-db server, just acknowledge
+    if (check(TokenType::KW_DATABASE)) {
+        advance();
+        match(TokenType::KW_IF); match(TokenType::KW_NOT); match(TokenType::KW_EXISTS);
+        UseDatabaseStmt s;
+        if (check(TokenType::IDENTIFIER)) s.db_name = strutil::to_upper(advance().value);
+        match(TokenType::SEMICOLON);
+        return s;
+    }
+    expect(TokenType::KW_TABLE, "TABLE");
 
     CreateTableStmt stmt;
 
@@ -623,8 +632,17 @@ DeleteStmt Parser::parse_delete() {
 }
 
 // ── DROP TABLE [IF EXISTS] name ───────────────────────────────────────────────
-DropTableStmt Parser::parse_drop() {
-    expect(TokenType::KW_DROP,  "DROP");
+Statement Parser::parse_drop() {
+    expect(TokenType::KW_DROP, "DROP");
+    // DROP DATABASE [IF EXISTS] name  — no-op on single-db server
+    if (check(TokenType::KW_DATABASE)) {
+        advance();
+        match(TokenType::KW_IF); match(TokenType::KW_EXISTS);
+        UseDatabaseStmt s;
+        if (check(TokenType::IDENTIFIER)) s.db_name = strutil::to_upper(advance().value);
+        match(TokenType::SEMICOLON);
+        return s;
+    }
     expect(TokenType::KW_TABLE, "TABLE");
     DropTableStmt stmt;
     if (check(TokenType::KW_IF)) {

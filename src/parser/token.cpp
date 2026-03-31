@@ -40,7 +40,6 @@ static const std::unordered_map<std::string, TokenType> KEYWORDS = {
     {"HAVING",    TokenType::KW_HAVING},
     {"LEFT",      TokenType::KW_LEFT},
     {"OUTER",     TokenType::KW_OUTER},
-    {"RIGHT",     TokenType::KW_RIGHT},
     {"USE",       TokenType::KW_USE},
     {"ALTER",     TokenType::KW_ALTER},
     {"ADD",       TokenType::KW_ADD},

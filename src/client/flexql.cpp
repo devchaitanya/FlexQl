@@ -61,25 +61,47 @@ static std::string parse_and_dispatch(
 
         if (line.size() >= 4 && line.substr(0, 4) == "ROW ") {
             if (callback == nullptr) continue;
-            std::string rest = line.substr(4);
-            std::vector<std::string> vals;
-            std::istringstream vs(rest);
-            std::string v;
-            while (vs >> v) vals.push_back(v);
+            // Parse length-prefixed format: ROW N len:col_name len:val ...
+            const std::string& text = line;
+            size_t pos = 4;
+            // Read column count
+            size_t spacePos = text.find(' ', pos);
+            if (spacePos == std::string::npos) continue;
+            int colCount = 0;
+            try { colCount = std::stoi(text.substr(pos, spacePos - pos)); } catch(...) { continue; }
+            pos = spacePos + 1;
+
+            std::vector<std::string> vals, row_col_names;
+            vals.reserve(colCount); row_col_names.reserve(colCount);
+            bool parse_ok = true;
+            for (int i = 0; i < colCount && parse_ok; ++i) {
+                // parse length-prefixed token: <len>:<data>
+                auto parse_lp = [&](std::string& out) -> bool {
+                    size_t colon = text.find(':', pos);
+                    if (colon == std::string::npos || colon == pos) return false;
+                    size_t len = 0;
+                    try { len = std::stoul(text.substr(pos, colon - pos)); } catch(...) { return false; }
+                    size_t start = colon + 1;
+                    if (start + len > text.size()) return false;
+                    out.assign(text, start, len);
+                    pos = start + len;
+                    return true;
+                };
+                std::string nm, vl;
+                if (!parse_lp(nm) || !parse_lp(vl)) { parse_ok = false; break; }
+                row_col_names.push_back(std::move(nm));
+                vals.push_back(std::move(vl));
+            }
+            if (!parse_ok) continue;
+
+            // Update col_names from ROW if COLS header wasn't provided
+            if (col_names.empty()) { col_names = row_col_names; out_col_names = col_names; }
 
             int n = (int)vals.size();
             std::vector<char*> cvals(n), cnames(n);
-            std::vector<std::string> fallback(n);
-            // Use real column names if count matches, else fallback col0/col1/...
-            bool have_names = ((int)col_names.size() == n);
             for (int i = 0; i < n; ++i) {
-                cvals[i] = const_cast<char*>(vals[i].c_str());
-                if (have_names) {
-                    cnames[i] = const_cast<char*>(col_names[i].c_str());
-                } else {
-                    fallback[i] = "col" + std::to_string(i);
-                    cnames[i]   = const_cast<char*>(fallback[i].c_str());
-                }
+                cvals[i]  = const_cast<char*>(vals[i].c_str());
+                cnames[i] = const_cast<char*>(row_col_names[i].c_str());
             }
             int ret = callback(arg, n, cvals.data(), cnames.data());
             if (ret != 0) break;

@@ -4,13 +4,13 @@
 #include "parser/ast.h"
 #include "query/executor.h"
 #include "storage/wal.h"
+#include "storage/snapshot.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <chrono>
-#include <csignal>
 #include <cstring>
 #include <iostream>
 
@@ -24,7 +24,6 @@ TcpServer::TcpServer(int port, int num_threads)
 TcpServer::~TcpServer() { stop(); }
 
 void TcpServer::run() {
-    // Create and bind socket
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd_ < 0) { perror("socket"); return; }
 
@@ -65,8 +64,20 @@ void TcpServer::stop() {
     running_ = false;
     if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
     pool_.shutdown();
-    // Flush WAL on clean shutdown
-    if (g_wal.is_open()) g_wal.sync();
+    if (g_wal.is_open()) {
+        // Write a snapshot so the next startup loads instantly instead of
+        // replaying the entire WAL from scratch.
+        uint64_t lsn = g_wal.next_lsn() > 1 ? g_wal.next_lsn() - 1 : 0;
+        std::string snap_path = "data/snapshots/snap_" + std::to_string(lsn) + ".bin";
+        if (Snapshot::write(snap_path, lsn)) {
+            std::cout << "[FlexQL server] snapshot written (lsn=" << lsn << ")\n";
+            g_wal.truncate();
+            std::cout << "[FlexQL server] WAL reset\n";
+        } else {
+            std::cerr << "[FlexQL server] WARNING: snapshot write failed, keeping WAL\n";
+            g_wal.sync();
+        }
+    }
 }
 
 // Determines whether a statement type must be durably logged to the WAL.
@@ -74,10 +85,10 @@ void TcpServer::stop() {
 static bool needs_wal(const Statement& stmt) {
     return std::visit([](const auto& s) -> bool {
         using T = std::decay_t<decltype(s)>;
-        if constexpr (std::is_same_v<T, SelectStmt>)      return false;
-        if constexpr (std::is_same_v<T, ShowTablesStmt>)  return false;
+        if constexpr (std::is_same_v<T, SelectStmt>)        return false;
+        if constexpr (std::is_same_v<T, ShowTablesStmt>)    return false;
         if constexpr (std::is_same_v<T, ShowDatabasesStmt>) return false;
-        if constexpr (std::is_same_v<T, DescribeStmt>)    return false;
+        if constexpr (std::is_same_v<T, DescribeStmt>)      return false;
         return true; // INSERT, UPDATE, DELETE, CREATE, DROP, TRUNCATE → log
     }, stmt);
 }
@@ -90,25 +101,23 @@ void TcpServer::handle_client(int client_fd) {
 
         std::string response;
         try {
-            auto t0         = std::chrono::high_resolution_clock::now();
-            Statement stmt  = Parser::parse(sql);
+            auto        t0   = std::chrono::high_resolution_clock::now();
+            Statement   stmt = Parser::parse(sql);
 
-            // ── WAL: append before execution (write-ahead guarantee) ──────────
-            // ── WAL: append before execution (write-ahead guarantee) ──────────
             if (g_wal.is_open() && needs_wal(stmt))
                 g_wal.append(sql);
 
-            QueryResult res = exec.execute(std::move(stmt));
-            auto t1         = std::chrono::high_resolution_clock::now();
-            res.elapsed_us  = std::chrono::duration_cast<
-                                  std::chrono::microseconds>(t1 - t0).count();
-            response        = protocol::encode_response(res);
+            QueryResult res  = exec.execute(std::move(stmt));
+            auto        t1   = std::chrono::high_resolution_clock::now();
+            res.elapsed_us   = std::chrono::duration_cast<
+                                   std::chrono::microseconds>(t1 - t0).count();
+            response         = protocol::encode_response(res);
         } catch (const ParseError& e) {
-            QueryResult err = QueryResult::err(std::string("parse error: ") + e.what());
-            response        = protocol::encode_response(err);
+            response = protocol::encode_response(
+                QueryResult::err(std::string("parse error: ") + e.what()));
         } catch (const std::exception& e) {
-            QueryResult err = QueryResult::err(std::string("internal error: ") + e.what());
-            response        = protocol::encode_response(err);
+            response = protocol::encode_response(
+                QueryResult::err(std::string("internal error: ") + e.what()));
         }
 
         if (!protocol::send_response(client_fd, response)) break;

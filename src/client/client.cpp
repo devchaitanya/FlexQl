@@ -140,6 +140,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
+                printf("\n"); // move table off the prompt line
                 if (collector.rows.empty()) {
                     if (!col_names.empty()) print_table(col_names, {});
                     printf("Empty set (%.3f sec)\n", elapsed);

@@ -99,7 +99,6 @@ private:
         return rows_vals_[row_idx * (size_t)num_cols_ + (size_t)col_idx];
     }
 
-    bool matches_where(size_t row_idx, const WhereClause& w) const;
     bool matches_pred(size_t row_idx, const Predicate& pred) const;
     bool compare_values(std::string_view row_val,
                         const std::string& op,
