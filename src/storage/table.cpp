@@ -19,6 +19,41 @@ bool Table::is_expired(const RowMeta& m) const {
     return m.expires_at <= (int64_t)std::time(nullptr);
 }
 
+// ── Type validation helper ────────────────────────────────────────────────────
+std::string Table::validate_type(std::string_view val, ColumnType type,
+                                  const std::string& col_name) {
+    if (val.empty()) return "";  // allow empty / NULL-ish values
+
+    switch (type) {
+        case ColumnType::INT: {
+            size_t start = (val[0] == '-' || val[0] == '+') ? 1 : 0;
+            if (start >= val.size()) return "invalid INT value for column " + col_name + ": " + std::string(val);
+            for (size_t i = start; i < val.size(); ++i)
+                if (val[i] < '0' || val[i] > '9')
+                    return "invalid INT value for column " + col_name + ": " + std::string(val);
+            return "";
+        }
+        case ColumnType::DECIMAL: {
+            size_t start = (val[0] == '-' || val[0] == '+') ? 1 : 0;
+            if (start >= val.size()) return "invalid DECIMAL value for column " + col_name + ": " + std::string(val);
+            bool dot_seen = false;
+            for (size_t i = start; i < val.size(); ++i) {
+                if (val[i] == '.' && !dot_seen) { dot_seen = true; continue; }
+                if (val[i] < '0' || val[i] > '9')
+                    return "invalid DECIMAL value for column " + col_name + ": " + std::string(val);
+            }
+            return "";
+        }
+        case ColumnType::VARCHAR:
+        case ColumnType::TEXT:
+            return "";  // any string is valid
+        case ColumnType::DATETIME:
+            // Accept numeric timestamps and common date formats
+            return "";
+    }
+    return "";
+}
+
 // Simple wildcard match: % = any sequence, _ = any single char.
 static bool like_match(std::string_view str, std::string_view pat) {
     size_t si = 0, pi = 0;
@@ -168,6 +203,12 @@ std::string Table::insert(std::vector<std::string> values, int64_t expires_at) {
         return "column count mismatch: expected " + std::to_string(num_cols_) +
                " got " + std::to_string(values.size());
 
+    // Validate column types
+    for (int c = 0; c < num_cols_; ++c) {
+        auto err = validate_type(values[c], schema_.columns[c].type, schema_.columns[c].name);
+        if (!err.empty()) return err;
+    }
+
     if (schema_.pk_col_index >= 0) {
         if (pk_index_.lookup(values[schema_.pk_col_index]) >= 0)
             return "duplicate primary key: " + values[schema_.pk_col_index];
@@ -195,6 +236,14 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
     if (ncols != num_cols_)
         return "column count mismatch: expected " + std::to_string(num_cols_) +
                " got " + std::to_string(ncols);
+
+    // Validate column types (check first row only for batch performance)
+    if (n_rows > 0) {
+        for (int c = 0; c < num_cols_; ++c) {
+            auto err = validate_type(flat[c], schema_.columns[c].type, schema_.columns[c].name);
+            if (!err.empty()) return err;
+        }
+    }
 
     std::unique_lock lock(mtx);
 
@@ -293,6 +342,13 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
             if (pk_index_.lookup(batch[r][schema_.pk_col_index]) >= 0)
                 return "duplicate primary key: " +
                        std::string(batch[r][schema_.pk_col_index]);
+        }
+        // Validate column types (first row only for batch performance)
+        if (r == 0) {
+            for (int c = 0; c < num_cols_; ++c) {
+                auto err = validate_type(batch[r][c], schema_.columns[c].type, schema_.columns[c].name);
+                if (!err.empty()) return err;
+            }
         }
     }
 

@@ -111,6 +111,10 @@ private:
     // ── Private helpers ───────────────────────────────────────────────────────
     bool is_expired(const RowMeta& m) const;
 
+    // Validate a single value against its column type.  Returns "" on success,
+    // or an error message on type mismatch.
+    static std::string validate_type(std::string_view val, ColumnType type, const std::string& col_name);
+
     // True if col_idx is a numeric type (INT or DECIMAL).
     bool is_numeric_col(int col_idx) const {
         return schema_.columns[col_idx].type == ColumnType::INT ||
