@@ -51,7 +51,7 @@ static int g_tests = 0, g_passed = 0, g_failed = 0;
     std::string(msg) + " (got '" + std::to_string(a) + "' expected '" + std::to_string(b) + "')")
 
 #define CHECK_STR_EQ(a, b, msg) CHECK((a) == (b), \
-    std::string(msg) + " (got '" + (a) + "' expected '" + (b) + "')")
+    std::string(msg) + " (got '" + std::string(a) + "' expected '" + std::string(b) + "')")
 
 #define SECTION(name) std::cout << "\n=== " << name << " ===\n"
 
@@ -444,7 +444,7 @@ static void test_table_insert_and_scan() {
 
     auto res = tbl.scan({"*"}, nullptr, {});
     CHECK(res.ok, "scan ok");
-    CHECK_EQ((int)res.rows.size(), 2, "2 rows");
+    CHECK_EQ((int)res.num_rows(), 2, "2 rows");
 }
 
 static void test_table_pk_enforcement() {
@@ -497,7 +497,7 @@ static void test_table_ttl_expiration() {
     auto res = tbl.scan({"*"}, nullptr, {});
     CHECK(res.ok, "scan ok");
     // Row 1 should be expired (expires_at=1 < now()), rows 2,3 should be live
-    CHECK_EQ((int)res.rows.size(), 2, "2 live rows (1 expired)");
+    CHECK_EQ((int)res.num_rows(), 2, "2 live rows (1 expired)");
 }
 
 static void test_table_delete() {
@@ -518,7 +518,7 @@ static void test_table_delete() {
     CHECK_EQ(deleted, 1, "1 row deleted");
 
     auto res = tbl.scan({"*"}, nullptr, {});
-    CHECK_EQ((int)res.rows.size(), 2, "2 rows remain");
+    CHECK_EQ((int)res.num_rows(), 2, "2 rows remain");
 }
 
 static void test_table_update() {
@@ -536,9 +536,9 @@ static void test_table_update() {
     CHECK_EQ(updated, 1, "1 row updated");
 
     auto res = tbl.scan({"NAME"}, nullptr, {});
-    CHECK(res.ok && !res.rows.empty(), "scan after update");
-    if (!res.rows.empty())
-        CHECK_STR_EQ(res.rows[0][0], std::string("new"), "value updated");
+    CHECK(res.ok && res.num_rows() > 0, "scan after update");
+    if (res.num_rows() > 0)
+        CHECK_STR_EQ(res.cell(0, 0), std::string("new"), "value updated");
 }
 
 static void test_table_truncate() {
@@ -554,7 +554,7 @@ static void test_table_truncate() {
     tbl.truncate();
 
     auto res = tbl.scan({"*"}, nullptr, {});
-    CHECK_EQ((int)res.rows.size(), 0, "0 rows after truncate");
+    CHECK_EQ((int)res.num_rows(), 0, "0 rows after truncate");
 }
 
 static void test_table_compact() {
@@ -578,12 +578,12 @@ static void test_table_compact() {
     tbl.compact();
 
     auto res = tbl.scan({"*"}, nullptr, {});
-    CHECK_EQ((int)res.rows.size(), 25, "25 rows after compact");
+    CHECK_EQ((int)res.num_rows(), 25, "25 rows after compact");
 
     // Verify PK lookups still work after compaction
     auto pred = Predicate::leaf("ID", "=", "1");
     res = tbl.scan({"V"}, &pred, {});
-    CHECK(res.ok && !res.rows.empty(), "PK lookup after compact");
+    CHECK(res.ok && res.num_rows() > 0, "PK lookup after compact");
 }
 
 static void test_table_flat_insert_batch() {
@@ -612,7 +612,7 @@ static void test_table_flat_insert_batch() {
     CHECK(err.empty(), "25K flat insert: " + err);
 
     auto res = tbl.scan({"*"}, nullptr, {});
-    CHECK_EQ((int)res.rows.size(), N, "25K rows scanned");
+    CHECK_EQ((int)res.num_rows(), N, "25K rows scanned");
 }
 
 static void test_table_where_operators() {
@@ -632,23 +632,23 @@ static void test_table_where_operators() {
     // GT
     auto pred = Predicate::leaf("ID", ">", "2");
     auto res = tbl.scan({"NAME"}, &pred, {});
-    CHECK_EQ((int)res.rows.size(), 2, "> 2 returns 2 rows");
+    CHECK_EQ((int)res.num_rows(), 2, "> 2 returns 2 rows");
 
     // LIKE
     pred = Predicate::leaf("NAME", "LIKE", "A%");
     res = tbl.scan({"NAME"}, &pred, {});
-    CHECK_EQ((int)res.rows.size(), 1, "LIKE A% returns 1 row");
+    CHECK_EQ((int)res.num_rows(), 1, "LIKE A% returns 1 row");
 
     // BETWEEN
     pred.kind = Predicate::LEAF;
     pred.col = "ID"; pred.op = "BETWEEN"; pred.val = "2"; pred.val2 = "10";
     res = tbl.scan({"NAME"}, &pred, {});
-    CHECK_EQ((int)res.rows.size(), 3, "BETWEEN 2 AND 10 returns 3 rows");
+    CHECK_EQ((int)res.num_rows(), 3, "BETWEEN 2 AND 10 returns 3 rows");
 
     // IN
     pred.op = "IN"; pred.in_vals = {"1", "3"};
     res = tbl.scan({"NAME"}, &pred, {});
-    CHECK_EQ((int)res.rows.size(), 2, "IN (1,3) returns 2 rows");
+    CHECK_EQ((int)res.num_rows(), 2, "IN (1,3) returns 2 rows");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -670,10 +670,10 @@ static void test_executor_create_insert_select() {
 
     r = exec.execute(Parser::parse("SELECT name FROM emp WHERE salary > 55000 ORDER BY name;"));
     CHECK(r.ok, "SELECT ok");
-    CHECK_EQ((int)r.rows.size(), 2, "2 rows match salary > 55000");
-    if (r.rows.size() >= 2) {
-        CHECK_STR_EQ(r.rows[0][0], std::string("Bob"), "first row = Bob");
-        CHECK_STR_EQ(r.rows[1][0], std::string("Carol"), "second row = Carol");
+    CHECK_EQ((int)r.num_rows(), 2, "2 rows match salary > 55000");
+    if (r.num_rows() >= 2) {
+        CHECK_STR_EQ(r.cell(0, 0), std::string("Bob"), "first row = Bob");
+        CHECK_STR_EQ(r.cell(1, 0), std::string("Carol"), "second row = Carol");
     }
 }
 
@@ -771,15 +771,15 @@ static void test_executor_delete_update() {
     CHECK(r.ok, "DELETE ok");
 
     r = exec.execute(Parser::parse("SELECT * FROM du;"));
-    CHECK_EQ((int)r.rows.size(), 2, "2 rows after delete");
+    CHECK_EQ((int)r.num_rows(), 2, "2 rows after delete");
 
     r = exec.execute(Parser::parse("UPDATE du SET v = 'updated' WHERE id = 1;"));
     CHECK(r.ok, "UPDATE ok");
 
     r = exec.execute(Parser::parse("SELECT v FROM du WHERE id = 1;"));
-    CHECK(r.ok && !r.rows.empty(), "select after update");
-    if (!r.rows.empty())
-        CHECK_STR_EQ(r.rows[0][0], std::string("updated"), "value updated");
+    CHECK(r.ok && r.num_rows() > 0, "select after update");
+    if (r.num_rows() > 0)
+        CHECK_STR_EQ(r.cell(0, 0), std::string("updated"), "value updated");
 }
 
 static void test_executor_errors() {
@@ -1000,7 +1000,7 @@ static void test_adversarial_boundary_ttl() {
     r = exec.execute(Parser::parse("SELECT * FROM ttl_test;"));
     CHECK(r.ok, "scan with boundary TTLs ok");
     // Rows 1 (no ttl) and 2 (far future) should be live; row 3 (negative→expired) depends on impl
-    CHECK((int)r.rows.size() >= 2, "at least 2 live rows with boundary TTLs");
+    CHECK((int)r.num_rows() >= 2, "at least 2 live rows with boundary TTLs");
 }
 
 static void test_adversarial_large_payload() {
@@ -1017,9 +1017,9 @@ static void test_adversarial_large_payload() {
     CHECK(r.ok, "1MB value insert ok");
 
     r = exec.execute(Parser::parse("SELECT data FROM big WHERE id = 1;"));
-    CHECK(r.ok && !r.rows.empty(), "select 1MB value");
-    if (!r.rows.empty())
-        CHECK_EQ((int)r.rows[0][0].size(), (int)big_val.size(), "1MB value round-trips");
+    CHECK(r.ok && r.num_rows() > 0, "select 1MB value");
+    if (r.num_rows() > 0)
+        CHECK_EQ((int)r.cell(0, 0).size(), (int)big_val.size(), "1MB value round-trips");
 }
 
 static void test_adversarial_sql_injection() {
@@ -1060,7 +1060,7 @@ static void test_adversarial_empty_table_operations() {
 
     auto r = exec.execute(Parser::parse("SELECT * FROM empty_t;"));
     CHECK(r.ok, "SELECT from empty table ok");
-    CHECK_EQ((int)r.rows.size(), 0, "0 rows from empty table");
+    CHECK_EQ((int)r.num_rows(), 0, "0 rows from empty table");
 
     r = exec.execute(Parser::parse("DELETE FROM empty_t WHERE id = 1;"));
     CHECK(r.ok, "DELETE from empty table ok");

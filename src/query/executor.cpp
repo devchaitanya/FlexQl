@@ -234,6 +234,20 @@ QueryResult Executor::exec_select(const SelectStmt& s) {
     }
 
     if (s.distinct) {
+        // Convert compact flat storage to rows for dedup, then clear flat storage
+        const size_t ncols = res.column_names.size();
+        const size_t nrows = res.num_rows();
+        if (!res.flat_offsets.empty()) {
+            res.rows.reserve(nrows);
+            for (size_t r = 0; r < nrows; ++r) {
+                std::vector<std::string> row(ncols);
+                for (size_t c = 0; c < ncols; ++c)
+                    row[c] = std::string(res.cell(r, c));
+                res.rows.push_back(std::move(row));
+            }
+            res.flat_offsets.clear();
+            res.flat_data.clear();
+        }
         std::set<std::vector<std::string>> seen;
         std::vector<std::vector<std::string>> unique_rows;
         for (auto& row : res.rows)
@@ -305,9 +319,10 @@ QueryResult Executor::exec_group_by(const SelectStmt& s) {
     // Build group key → rows map (preserves insertion order with vector)
     std::vector<std::string>                            group_keys_ordered;
     std::unordered_map<std::string, std::vector<size_t>> groups;
-    for (size_t r = 0; r < base.rows.size(); ++r) {
+    const size_t base_nrows = base.num_rows();
+    for (size_t r = 0; r < base_nrows; ++r) {
         std::string key;
-        for (int gi : grp_idx) { key += base.rows[r][gi]; key += '\0'; }
+        for (int gi : grp_idx) { key += base.cell(r, (size_t)gi); key += '\0'; }
         auto it = groups.find(key);
         if (it == groups.end()) {
             group_keys_ordered.push_back(key);
@@ -352,7 +367,7 @@ QueryResult Executor::exec_group_by(const SelectStmt& s) {
         for (auto& ag : aggs) {
             if (ag.func == "COL") {
                 int cidx = std::stoi(ag.col);
-                out_row[ag.out_col_idx] = base.rows[row_idxs[0]][cidx];
+                out_row[ag.out_col_idx] = base.cell(row_idxs[0], (size_t)cidx);
                 continue;
             }
             if (ag.func == "COUNT") {
@@ -369,16 +384,16 @@ QueryResult Executor::exec_group_by(const SelectStmt& s) {
             std::string minstr, maxstr;
             int cnt = 0;
             for (size_t ri : row_idxs) {
-                const std::string& v = base.rows[ri][cidx];
+                auto v = base.cell(ri, (size_t)cidx);
                 try {
-                    double d = std::stod(v);
+                    double d = std::stod(std::string(v));
                     sumv += d;
-                    if (d < minv) { minv = d; minstr = v; }
-                    if (d > maxv) { maxv = d; maxstr = v; }
+                    if (d < minv) { minv = d; minstr = std::string(v); }
+                    if (d > maxv) { maxv = d; maxstr = std::string(v); }
                     ++cnt;
                 } catch (...) {
-                    if (minstr.empty() || v < minstr) minstr = v;
-                    if (maxstr.empty() || v > maxstr) maxstr = v;
+                    if (minstr.empty() || v < minstr) minstr = std::string(v);
+                    if (maxstr.empty() || v > maxstr) maxstr = std::string(v);
                     ++cnt;
                 }
             }

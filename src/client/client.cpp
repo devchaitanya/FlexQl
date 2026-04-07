@@ -93,18 +93,35 @@ int main(int argc, char* argv[]) {
 
         if (!std::getline(std::cin, line)) break; // EOF / Ctrl-D
 
-        if (buffer.empty()) {
-            if (line == ".exit" || line == ".quit") break;
-            if (line == ".help") {
-                printf("Commands: .exit  .quit  .help\n");
-                printf("SQL:      CREATE TABLE, INSERT, SELECT [DISTINCT] [LIMIT n]\n");
-                printf("          UPDATE ... SET, DELETE, TRUNCATE TABLE\n");
-                printf("          SELECT COUNT(*) / SUM / AVG / MIN / MAX\n");
-                printf("          WHERE col LIKE 'pattern%%'  (%%=any, _=one char)\n");
-                printf("          ORDER BY, GROUP BY, HAVING\n");
-                printf("          INNER JOIN / LEFT JOIN, SHOW TABLES, DESCRIBE\n");
-                continue;
+        // Trim leading/trailing whitespace from the line for dot-command detection
+        std::string ltrimmed = line;
+        while (!ltrimmed.empty() && std::isspace((unsigned char)ltrimmed.front()))
+            ltrimmed.erase(ltrimmed.begin());
+        while (!ltrimmed.empty() && std::isspace((unsigned char)ltrimmed.back()))
+            ltrimmed.pop_back();
+
+        // Dot-commands always take priority (even mid-buffer)
+        if (ltrimmed == ".exit" || ltrimmed == ".quit") break;
+        if (ltrimmed == ".help") {
+            printf("Commands: .exit  .quit  .help  .tables  .clear\n");
+            printf("SQL:      CREATE TABLE, INSERT, SELECT [DISTINCT] [LIMIT n]\n");
+            printf("          UPDATE ... SET, DELETE, TRUNCATE TABLE\n");
+            printf("          SELECT COUNT(*) / SUM / AVG / MIN / MAX\n");
+            printf("          WHERE col LIKE 'pattern%%'  (%%=any, _=one char)\n");
+            printf("          ORDER BY, GROUP BY, HAVING\n");
+            printf("          INNER JOIN / LEFT JOIN, SHOW TABLES, DESCRIBE\n");
+            continue;
+        }
+        if (ltrimmed == ".tables") {
+            // Shortcut for SHOW TABLES
+            line = "SHOW TABLES;";
+        }
+        if (ltrimmed == ".clear") {
+            if (!buffer.empty()) {
+                buffer.clear();
+                printf("Buffer cleared.\n");
             }
+            continue;
         }
 
         buffer += line;

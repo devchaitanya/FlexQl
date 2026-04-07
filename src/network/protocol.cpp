@@ -5,6 +5,16 @@
 
 namespace protocol {
 
+// Fast unsigned integer to string (returns length written)
+static inline int fast_u64(size_t val, char* buf) {
+    if (val == 0) { buf[0] = '0'; return 1; }
+    char tmp[20];
+    int pos = 0;
+    while (val) { tmp[pos++] = '0' + (char)(val % 10); val /= 10; }
+    for (int i = 0; i < pos; ++i) buf[i] = tmp[pos - 1 - i];
+    return pos;
+}
+
 std::string encode_response(const QueryResult& res) {
     if (!res.ok)
         return "ERROR: " + res.error + "\nEND\n";
@@ -13,34 +23,66 @@ std::string encode_response(const QueryResult& res) {
         return "OK\nEND\n";
 
     const int ncols = (int)res.column_names.size();
+    const size_t nrows = res.num_rows();
     std::string out;
-    out.reserve(res.rows.size() * ncols * 24 + 32);
+    out.reserve(nrows * ncols * 24 + 32);
 
-    // COLS header: kept for our REPL client (used when result set is empty);
-    // the official benchmark client ignores unrecognised lines.
+    // COLS header
     out += "COLS";
     for (const auto& col : res.column_names) { out += ' '; out += col; }
     out += '\n';
 
-    // ROW lines: official length-prefixed format
-    //   ROW <N> <len>:<col_name><len>:<col_val>...\n
-    // This is what the official benchmark flexql.cpp parses via parse_row_payload().
-    char numbuf[24];
-    for (const auto& row : res.rows) {
-        out += "ROW ";
-        int n = snprintf(numbuf, sizeof(numbuf), "%d", ncols);
-        out.append(numbuf, n);
-        out += ' ';
-        for (int i = 0; i < ncols; ++i) {
-            const std::string& name = res.column_names[i];
-            const std::string& val  = (i < (int)row.size()) ? row[i] : "";
-            n = snprintf(numbuf, sizeof(numbuf), "%zu", name.size());
-            out.append(numbuf, n); out += ':'; out += name;
-            n = snprintf(numbuf, sizeof(numbuf), "%zu", val.size());
-            out.append(numbuf, n); out += ':'; out += val;
-        }
-        out += '\n';
+    // Pre-compute static row prefix and column name parts
+    char row_prefix[32];
+    int rp_len = 4;
+    std::memcpy(row_prefix, "ROW ", 4);
+    rp_len += fast_u64((size_t)ncols, row_prefix + rp_len);
+    row_prefix[rp_len++] = ' ';
+
+    std::vector<std::string> col_hdr(ncols);
+    for (int i = 0; i < ncols; ++i) {
+        char lbuf[16];
+        int ln = fast_u64(res.column_names[i].size(), lbuf);
+        col_hdr[i].append(lbuf, ln);
+        col_hdr[i] += ':';
+        col_hdr[i] += res.column_names[i];
     }
+
+    char lbuf[16];
+
+    if (!res.flat_offsets.empty()) {
+        const char* data = res.flat_data.data();
+        const uint32_t* offs = res.flat_offsets.data();
+        size_t cell_idx = 0;
+        for (size_t r = 0; r < nrows; ++r) {
+            out.append(row_prefix, rp_len);
+            for (int i = 0; i < ncols; ++i) {
+                out += col_hdr[i];
+                uint32_t off = offs[cell_idx];
+                uint32_t len = offs[cell_idx + 1] - off;
+                int ln = fast_u64(len, lbuf);
+                out.append(lbuf, ln);
+                out += ':';
+                out.append(data + off, len);
+                ++cell_idx;
+            }
+            out += '\n';
+        }
+    } else {
+        for (size_t r = 0; r < nrows; ++r) {
+            out.append(row_prefix, rp_len);
+            for (int i = 0; i < ncols; ++i) {
+                out += col_hdr[i];
+                const std::string& val = res.rows[r][i];
+                int ln = fast_u64(val.size(), lbuf);
+                out.append(lbuf, ln);
+                out += ':';
+                out += val;
+            }
+            out += '\n';
+        }
+    }
+
     out += "END\n";
     return out;
 }
@@ -90,37 +132,78 @@ bool stream_response(int fd, const QueryResult& res) {
         return send_all(fd, "OK\nEND\n");
 
     const int ncols = (int)res.column_names.size();
+    const size_t nrows = res.num_rows();
     std::string buf;
-    buf.reserve(256 * 1024); // 256 KB buffer
+    buf.reserve(256 * 1024);
 
     // COLS header
     buf = "COLS";
     for (const auto& col : res.column_names) { buf += ' '; buf += col; }
     buf += '\n';
 
-    static constexpr size_t FLUSH_THRESHOLD = 200 * 1024; // flush every ~200 KB
-    char numbuf[24];
+    // Pre-compute static row prefix: "ROW <ncols> "
+    char row_prefix[32];
+    int rp_len = 4; // "ROW "
+    std::memcpy(row_prefix, "ROW ", 4);
+    rp_len += fast_u64((size_t)ncols, row_prefix + rp_len);
+    row_prefix[rp_len++] = ' ';
 
-    for (const auto& row : res.rows) {
-        buf += "ROW ";
-        int n = snprintf(numbuf, sizeof(numbuf), "%d", ncols);
-        buf.append(numbuf, n);
-        buf += ' ';
-        for (int i = 0; i < ncols; ++i) {
-            const std::string& name = res.column_names[i];
-            const std::string& val  = (i < (int)row.size()) ? row[i] : "";
-            n = snprintf(numbuf, sizeof(numbuf), "%zu", name.size());
-            buf.append(numbuf, n); buf += ':'; buf += name;
-            n = snprintf(numbuf, sizeof(numbuf), "%zu", val.size());
-            buf.append(numbuf, n); buf += ':'; buf += val;
+    // Pre-compute per-column name part: "<name_len>:<name>"
+    std::vector<std::string> col_hdr(ncols);
+    for (int i = 0; i < ncols; ++i) {
+        char lbuf[16];
+        int ln = fast_u64(res.column_names[i].size(), lbuf);
+        col_hdr[i].append(lbuf, ln);
+        col_hdr[i] += ':';
+        col_hdr[i] += res.column_names[i];
+    }
+
+    static constexpr size_t FLUSH_THRESHOLD = 200 * 1024;
+    char lbuf[16];
+
+    // Use compact flat storage path when available
+    if (!res.flat_offsets.empty()) {
+        const char* data = res.flat_data.data();
+        const uint32_t* offs = res.flat_offsets.data();
+        size_t cell_idx = 0;
+        for (size_t r = 0; r < nrows; ++r) {
+            buf.append(row_prefix, rp_len);
+            for (int i = 0; i < ncols; ++i) {
+                buf += col_hdr[i];
+                uint32_t off = offs[cell_idx];
+                uint32_t len = offs[cell_idx + 1] - off;
+                int ln = fast_u64(len, lbuf);
+                buf.append(lbuf, ln);
+                buf += ':';
+                buf.append(data + off, len);
+                ++cell_idx;
+            }
+            buf += '\n';
+            if (buf.size() >= FLUSH_THRESHOLD) {
+                if (!send_all(fd, buf)) return false;
+                buf.clear();
+            }
         }
-        buf += '\n';
-
-        if (buf.size() >= FLUSH_THRESHOLD) {
-            if (!send_all(fd, buf)) return false;
-            buf.clear();
+    } else {
+        // Fallback for nested rows storage (JOIN, aggregates, etc.)
+        for (size_t r = 0; r < nrows; ++r) {
+            buf.append(row_prefix, rp_len);
+            for (int i = 0; i < ncols; ++i) {
+                buf += col_hdr[i];
+                const std::string& val = res.rows[r][i];
+                int ln = fast_u64(val.size(), lbuf);
+                buf.append(lbuf, ln);
+                buf += ':';
+                buf += val;
+            }
+            buf += '\n';
+            if (buf.size() >= FLUSH_THRESHOLD) {
+                if (!send_all(fd, buf)) return false;
+                buf.clear();
+            }
         }
     }
+
     buf += "END\n";
     return send_all(fd, buf);
 }

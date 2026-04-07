@@ -610,7 +610,7 @@ All benchmarks run on a 1\,M-row table (\texttt{BENCH}: 5 columns, no primary ke
 unless stated otherwise.
 
 \noindent\textbf{Hardware:} Intel Core i5-1135G7 @ 2.40\,GHz, 14\,GB RAM, Ubuntu Linux.\\
-\textbf{Build:} \texttt{-O3 -march=native -std=c++17}.
+\textbf{Build:} \texttt{-O3 -march=native -std=c++17 -pthread}.
 
 \subsection{INSERT Throughput}
 
@@ -620,18 +620,14 @@ unless stated otherwise.
 \toprule
 \textbf{Dataset} & \textbf{Elapsed} & \textbf{Throughput} \\
 \midrule
-1\,M rows  & 277\,ms   & 3,610,108 rows/sec \\
-10\,M rows & 3,548\,ms & 2,818,489 rows/sec \\
+1\,M rows  & 280\,ms   & 3.57\,M rows/sec \\
+10\,M rows & 3,349\,ms & 2.99\,M rows/sec \\
 \bottomrule
 \end{tabular}
-\caption{INSERT benchmark --- batch size 5,000 (with dual int64 storage)}
+\caption{INSERT benchmark (batch size 5\,K--25\,K)}
 \end{table}
 
-The dual \texttt{int64\_t} storage adds a single \texttt{parse\_int64()} call per numeric
-value during INSERT. This overhead is negligible: throughput remains above 2.8\,M~rows/sec
-even at 10\,M rows.
-
-\subsection{SELECT Queries}
+\subsection{SELECT and Aggregate Queries (1\,M rows)}
 
 \begin{table}[H]
 \centering
@@ -639,44 +635,45 @@ even at 10\,M rows.
 \toprule
 \textbf{Query} & \textbf{Rows} & \textbf{Elapsed} \\
 \midrule
-\texttt{SELECT COUNT(*) FROM BENCH}                          & 1       & 174\,ms  \\
-\texttt{SELECT * FROM BENCH} (full scan)                     & 1\,M    & 1,504\,ms \\
-\texttt{SELECT * WHERE ID = 500000}                          & 1       & 0.75\,ms \\
-\texttt{SELECT * WHERE SALARY > 90000}                       & 139,986 & 172\,ms  \\
-\texttt{SELECT * WHERE SALARY BETWEEN 50000 AND 60000}       & 140,015 & 168\,ms  \\
-\texttt{SELECT * WHERE DEPT IN ('ENG','HR','FIN')}           & 375,000 & 571\,ms  \\
-\texttt{SELECT * WHERE NAME LIKE 'user1\%'}                  & 111,112 & 179\,ms  \\
-\texttt{SELECT * ORDER BY SALARY DESC LIMIT 10}              & 10      & 200\,ms  \\
-\texttt{SELECT * ORDER BY ID DESC LIMIT 100 OFFSET 1000}     & 100     & 209\,ms  \\
-\texttt{SELECT DISTINCT DEPT FROM BENCH}                     & 8       & 94\,ms   \\
+\texttt{SELECT COUNT(*)}                                     & 1       & 1.2\,ms  \\
+\texttt{SELECT *} (full scan)                                & 1\,M    & 608\,ms  \\
+\texttt{SELECT * WHERE ID = 500000}                          & 1       & 0.8\,ms  \\
+\texttt{SELECT * WHERE SALARY > 90000}                       & 139,986 & 83\,ms   \\
+\texttt{SELECT * WHERE SALARY BETWEEN 50000 AND 60000}       & 140,015 & 84\,ms   \\
+\texttt{SELECT * WHERE DEPT IN ('ENG','HR','FIN')}           & 375,000 & 324\,ms  \\
+\texttt{SELECT * WHERE NAME LIKE 'user1\%'}                  & 111,112 & 113\,ms  \\
+\texttt{SELECT * ORDER BY SALARY DESC LIMIT 10}              & 10      & 8.5\,ms  \\
+\texttt{SELECT DISTINCT DEPT}                                & 8       & 113\,ms  \\
+\texttt{SELECT SUM/AVG/MIN/MAX(SALARY)}                      & 1       & 3.9--4.2\,ms \\
+\texttt{GROUP BY DEPT} (8 groups)                            & 8       & 79\,ms   \\
 \bottomrule
 \end{tabular}
-\caption{SELECT query latencies on 1\,M-row table}
+\caption{SELECT and aggregate query latencies on 1\,M-row table}
 \end{table}
 
-SIMD-accelerated numeric scans (\texttt{WHERE ID = 500000}, \texttt{SALARY > 90000},
-\texttt{BETWEEN}) run $2\text{--}148\times$ faster than the pre-SIMD string-parsing path.
-\texttt{ORDER BY} on numeric columns uses native \texttt{int64\_t} comparisons, reducing
-sort time from $\sim$1,100\,ms to $\sim$200\,ms ($5.7\times$).
-
-\subsection{Aggregate Queries}
+\subsection{SELECT Queries (10\,M rows)}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{L{9cm} r}
+\begin{tabular}{L{9cm} r r}
 \toprule
-\textbf{Query} & \textbf{Elapsed} \\
+\textbf{Query} & \textbf{Rows} & \textbf{Elapsed} \\
 \midrule
-\texttt{SELECT SUM(SALARY)}                                & 165\,ms \\
-\texttt{SELECT AVG(SALARY)}                                & 174\,ms \\
-\texttt{SELECT MIN(SALARY)}                                & 173\,ms \\
-\texttt{SELECT MAX(SALARY)}                                & 173\,ms \\
-\texttt{GROUP BY DEPT} (8 groups)                          & 226\,ms \\
-\texttt{GROUP BY DEPT HAVING AVG(SALARY)>60000}            & 174\,ms \\
+\texttt{SELECT COUNT(*)}                                     & 1         & 11\,ms     \\
+\texttt{SELECT * WHERE ID = 5000000}                         & 1         & 5.3\,ms    \\
+\texttt{SELECT * WHERE BALANCE > 10000}                      & 999,000   & 526\,ms    \\
+\texttt{SELECT * WHERE BALANCE BETWEEN 5000 AND 6000}        & 1,001,000 & 529\,ms    \\
+\texttt{SELECT * WHERE ID IN (4 values)}                     & 4         & 8.3\,ms    \\
+\texttt{SELECT * WHERE NAME LIKE 'user1\%'}                  & 1,111,112 & 1,035\,ms  \\
+\texttt{SELECT * ORDER BY BALANCE DESC LIMIT 10}             & 10        & 80\,ms     \\
+\texttt{SELECT SUM/AVG/MIN/MAX(BALANCE)}                     & 1         & 27--30\,ms \\
 \bottomrule
 \end{tabular}
-\caption{Aggregate query latencies on 1\,M-row table}
+\caption{SELECT query latencies on 10\,M-row table (3 columns)}
 \end{table}
+
+Aggregates on 10\,M rows complete in 27--30\,ms via the native \texttt{int64\_t}
+fast path.  Point lookups remain under 10\,ms at 10$\times$ scale.
 
 \subsection{JOIN Queries}
 
@@ -686,15 +683,15 @@ sort time from $\sim$1,100\,ms to $\sim$200\,ms ($5.7\times$).
 \toprule
 \textbf{Query} & \textbf{Rows} & \textbf{Elapsed} \\
 \midrule
-\texttt{INNER JOIN} (1\,M $\times$ 8, all match)      & 1\,M    & 960\,ms \\
-\texttt{INNER JOIN + WHERE SALARY>90000}               & 139,986 & 372\,ms \\
-\texttt{LEFT JOIN} (1\,M $\times$ 8)                   & 1\,M    & 1,195\,ms \\
+\texttt{INNER JOIN} (1\,M $\times$ 8, all match)      & 1\,M    & 574\,ms \\
+\texttt{INNER JOIN + WHERE SALARY>90000}               & 139,986 & 312\,ms \\
+\texttt{LEFT JOIN} (1\,M $\times$ 8)                   & 1\,M    & 692\,ms \\
 \bottomrule
 \end{tabular}
 \caption{JOIN query latencies (BENCH 1\,M rows $\times$ DEPARTMENTS 8 rows)}
 \end{table}
 
-\subsection{UPDATE and DELETE}
+\subsection{UPDATE, DELETE, and Cache}
 
 \begin{table}[H]
 \centering
@@ -702,122 +699,64 @@ sort time from $\sim$1,100\,ms to $\sim$200\,ms ($5.7\times$).
 \toprule
 \textbf{Operation} & \textbf{Elapsed} \\
 \midrule
-\texttt{UPDATE} single row (\texttt{WHERE ID=1})                 & 91\,ms  \\
-\texttt{UPDATE} 1,000 rows (\texttt{WHERE ID<=1000})             & 74\,ms  \\
-\texttt{UPDATE} filtered (\texttt{WHERE DEPT='QA'})               & 55\,ms  \\
-\texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 76\,ms  \\
-\texttt{DELETE} filtered (\texttt{WHERE DEPT='LEGAL'})            & 54\,ms  \\
+\texttt{UPDATE} single row (\texttt{WHERE ID=1})                 & 49\,ms  \\
+\texttt{UPDATE} 1,000 rows (\texttt{WHERE ID<=1000})             & 76\,ms  \\
+\texttt{DELETE} 100 rows (\texttt{WHERE ID<=100})                 & 80\,ms  \\
+LRU cache cold $\to$ warm (point query)                          & 0.82\,ms $\to$ 0.02\,ms ($37\times$) \\
 \bottomrule
 \end{tabular}
-\caption{UPDATE / DELETE latencies on 1\,M-row table}
+\caption{UPDATE / DELETE / Cache latencies on 1\,M-row table}
 \end{table}
 
-\subsection{LRU Cache Effect}
+\subsection{Concurrency}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{lr}
+\begin{tabular}{L{5.5cm} rrrr}
 \toprule
-\textbf{Invocation} & \textbf{Elapsed} \\
+\textbf{Benchmark} & \textbf{Threads} & \textbf{Avg Latency} & \textbf{Throughput} \\
 \midrule
-First  (cold cache) & 0.80\,ms \\
-Second (warm cache) & 0.10\,ms \\
-Third  (warm cache) & 0.03\,ms \\
+\multicolumn{4}{l}{\textit{Concurrent reads (point queries, 1\,M rows)}} \\
+ & 1 & 0.67\,ms & 20 queries / 2\,ms \\
+ & 4 & 0.64\,ms & 80 queries / 2\,ms \\
+ & 8 & 0.40\,ms & 160 queries / 3\,ms \\
+\midrule
+\multicolumn{4}{l}{\textit{Mixed read/write (3-second run, 1\,M rows)}} \\
+4\,R + 1\,W  &  5 & --- & 239 ops/sec \\
+4\,R + 4\,W  &  8 & --- & 291 ops/sec \\
+\midrule
+\multicolumn{4}{l}{\textit{Concurrent INSERTs (separate tables, 50\,K rows/thread)}} \\
+ & 1 &  --- & 5.0\,M rows/sec \\
+ & 4 &  --- & 18.2\,M rows/sec \\
+ & 8 &  --- & 16.7\,M rows/sec \\
 \bottomrule
 \end{tabular}
-\caption{Cache hit vs.\ miss for a point query. Cold query now uses SIMD fast path (0.8\,ms)
-instead of \texttt{stod()}-based scan ($\sim$113\,ms). Speedup: $\sim$29$\times$}
+\caption{Concurrency benchmarks --- \texttt{shared\_lock} for reads, per-table
+\texttt{unique\_lock} for writes}
 \end{table}
 
-\subsection{Concurrency --- Concurrent Reads}
+\subsection{Primary Key Index}
 
 \begin{table}[H]
 \centering
-\begin{tabular}{rrrr}
+\begin{tabular}{L{8cm} r r}
 \toprule
-\textbf{Threads} & \textbf{Queries} & \textbf{Avg Latency} & \textbf{COUNT(*) wall-clock} \\
+\textbf{Operation} & \textbf{Rows} & \textbf{Elapsed} \\
 \midrule
-1 & 20  & 0.68\,ms & 144\,ms \\
-4 & 80  & 0.63\,ms & 201\,ms \\
-8 & 160 & 0.46\,ms & 406\,ms \\
+PK INSERT 100\,K rows                   & 100,000 & 36\,ms  \\
+PK point lookup (\texttt{ID=50000})      & 1       & $<$1\,ms \\
+PK IN lookup (4 keys)                    & 4       & $<$1\,ms \\
+PK duplicate INSERT rejection            & ---     & $<$1\,ms \\
 \bottomrule
 \end{tabular}
-\caption{Concurrent read scaling (\texttt{shared\_lock} allows parallel readers)}
+\caption{Primary key hash-map operations (flat open-addressing FNV-64)}
 \end{table}
 
-Per-query latency is sub-millisecond because the SIMD numeric scan path processes
-point queries in $\sim$0.5\,ms. Wall-clock for 8 simultaneous \texttt{COUNT(*)} scans
-is only $2.8\times$ that of a single scan, showing good read parallelism.
+\subsection{Memory and Tests}
 
-\subsection{Concurrency --- Mixed Read/Write Workload}
+Server RSS: 520\,MB after 1\,M-row seed, 788\,MB after full benchmark suite.
+\textbf{564 / 564} unit tests pass (\texttt{make test}).
 
-\begin{table}[H]
-\centering
-\begin{tabular}{L{4cm} rrr}
-\toprule
-\textbf{Config} & \textbf{Read ops} & \textbf{Write ops} & \textbf{Total ops/sec} \\
-\midrule
-4 readers + 1 writer  & 853 & 63 & 305 \\
-4 readers + 4 writers & 1,099 & 67 & 370 \\
-\bottomrule
-\end{tabular}
-\caption{Mixed workload over 3 seconds (point queries + single-row UPDATEs)}
-\end{table}
-
-With SIMD scans, read throughput jumped from $\sim$33 to $\sim$305 ops/sec (9$\times$)
-because point queries now complete in sub-millisecond time instead of $\sim$100\,ms.
-Write contention still reduces read throughput because each \texttt{UPDATE} acquires an
-exclusive \texttt{unique\_lock}, blocking concurrent readers momentarily.
-
-\subsection{Concurrency --- Concurrent Inserts (Separate Tables)}
-
-\begin{table}[H]
-\centering
-\begin{tabular}{rrrr}
-\toprule
-\textbf{Threads} & \textbf{Total Rows} & \textbf{Wall-clock} & \textbf{Agg.\ Throughput} \\
-\midrule
-1 &  50\,K  &  10\,ms  &  5.00\,M rows/sec \\
-4 & 200\,K  & 13\,ms  & 15.38\,M rows/sec \\
-8 & 400\,K  & 30\,ms  & 13.33\,M rows/sec \\
-\bottomrule
-\end{tabular}
-\caption{Concurrent INSERT into separate tables (per-table locks, no contention)}
-\end{table}
-
-When each thread writes to its own table, per-table \texttt{unique\_lock} causes zero
-contention. Aggregate throughput scales almost linearly: 8 threads achieve
-$2.6\times$ the throughput of 1 thread.
-
-\subsection{Memory Footprint}
-
-\begin{table}[H]
-\centering
-\begin{tabular}{lr}
-\toprule
-\textbf{State} & \textbf{Server RSS} \\
-\midrule
-Idle (no tables)                  &   7.1\,MB \\
-After 1\,M-row seed (5 columns)  & 161.8\,MB \\
-After full benchmark suite        & $\sim$1.0\,GB \\
-\bottomrule
-\end{tabular}
-\caption{Server resident set size at different stages}
-\end{table}
-
-The 1\,M-row table uses $\sim$155\,MB of memory (StringArena slabs + row metadata +
-\texttt{string\_view} array + \texttt{int\_cols\_} native integer arrays). The extra
-$\sim$24\,MB over the pre-SIMD baseline comes from the dual \texttt{int64\_t} storage
-for the 3 numeric columns ($3 \times 1\text{M} \times 8\text{B} = 24\text{MB}$).
-
-\subsection{Unit Test Results}
-
-\textbf{564 / 564} standalone tests pass (\texttt{make test}). Test categories: parser
-(17 functions), primary-key index (3), StringArena (4), table storage (10), executor
-end-to-end (6), concurrency stress (3), adversarial inputs (5). Sanitiser targets
-\texttt{make test-asan} and \texttt{make test-tsan} are also available.
-
-% ══════════════════════════════════════════════════════════════════════════════
 \section{Compilation and Execution}
 
 \subsection{Requirements}

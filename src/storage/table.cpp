@@ -699,8 +699,16 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
             res.column_names = out_names;
             if (pos >= 0) {
                 size_t idx = (size_t)pos;
-                if (!rows_meta_[idx].deleted && !is_expired(rows_meta_[idx]))
-                    res.rows.push_back(project(idx, col_indices));
+                if (!rows_meta_[idx].deleted && !is_expired(rows_meta_[idx])) {
+                    size_t ncols = col_indices.size();
+                    res.flat_offsets.reserve(ncols + 1);
+                    for (int c : col_indices) {
+                        res.flat_offsets.push_back((uint32_t)res.flat_data.size());
+                        auto sv = val_at(idx, c);
+                        res.flat_data.append(sv.data(), sv.size());
+                    }
+                    res.flat_offsets.push_back((uint32_t)res.flat_data.size());
+                }
             }
             return res;
         }
@@ -717,14 +725,20 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
             where->op == "IN") {
             QueryResult res;
             res.column_names = out_names;
+            res.flat_offsets.reserve(where->in_vals.size() * col_indices.size() + 1);
             for (const auto& v : where->in_vals) {
                 long long pos = pk_index_.lookup(v);
                 if (pos >= 0) {
                     size_t idx = (size_t)pos;
                     if (!rows_meta_[idx].deleted && !is_expired(rows_meta_[idx]))
-                        res.rows.push_back(project(idx, col_indices));
+                        for (int c : col_indices) {
+                            res.flat_offsets.push_back((uint32_t)res.flat_data.size());
+                            auto sv = val_at(idx, c);
+                            res.flat_data.append(sv.data(), sv.size());
+                        }
                 }
             }
+            res.flat_offsets.push_back((uint32_t)res.flat_data.size());
             return res;
         }
     }
@@ -845,11 +859,28 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
     if (offset > 0) start = std::min((size_t)offset, end);
     if (limit >= 0)  end   = std::min(end, start + (size_t)limit);
 
+    const size_t ncols = col_indices.size();
+    const size_t nrows = end - start;
+
     QueryResult res;
     res.column_names = out_names;
-    res.rows.reserve(end - start);
-    for (size_t i = start; i < end; ++i)
-        res.rows.push_back(project(row_idxs[i], col_indices));
+    // Estimate average cell size (~12 bytes) to pre-reserve the data buffer
+    res.flat_data.reserve(nrows * ncols * 12);
+    res.flat_offsets.resize(nrows * ncols + 1);
+    size_t cell_idx = 0;
+    for (size_t i = start; i < end; ++i) {
+        size_t row_idx = row_idxs[i];
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            int c = col_indices[ci];
+            res.flat_offsets[cell_idx] = (uint32_t)res.flat_data.size();
+            if (c >= 0 && c < num_cols_) {
+                auto sv = val_at(row_idx, c);
+                res.flat_data.append(sv.data(), sv.size());
+            }
+            ++cell_idx;
+        }
+    }
+    res.flat_offsets[cell_idx] = (uint32_t)res.flat_data.size();
 
     return res;
 }
