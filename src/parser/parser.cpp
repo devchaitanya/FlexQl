@@ -2,6 +2,7 @@
 #include "parser/ast.h"
 #include "utils/string_utils.h"
 #include <optional>
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <memory>
@@ -64,7 +65,10 @@ static std::optional<InsertStmt> fast_parse_insert(const std::string& sql) {
     }
 
     if (!match_kw("VALUES")) return std::nullopt;
-    stmt.flat_values.reserve(5 * 25000); // 125K for 25K rows × 5 cols
+    // Rough upper bound on the number of values from the text size (a value
+    // plus its separator is ≥ 2 chars), capped: avoids reserving 2 MB of views
+    // for a one-row INSERT.
+    stmt.flat_values.reserve(std::min<size_t>(sql.size() / 2 + 8, 5 * 25000));
 
     int first_row_ncols = 0;
     bool first_row = true;
@@ -83,6 +87,10 @@ static std::optional<InsertStmt> fast_parse_insert(const std::string& sql) {
                 const char* s = ++p;
                 const char* q = (const char*)std::memchr(s, '\'', (size_t)(end - s));
                 if (!q) return std::nullopt;
+                // '' inside a string is an escaped quote ('O''Brien'). The value
+                // is then not a plain slice of the text → let the full parser
+                // (which unescapes) handle this statement.
+                if (q + 1 < end && q[1] == '\'') return std::nullopt;
                 stmt.flat_values.push_back({s, (size_t)(q - s)});
                 p = q + 1;
             } else if ((unsigned)(unsigned char)*p - '0' < 10u ||
@@ -90,6 +98,13 @@ static std::optional<InsertStmt> fast_parse_insert(const std::string& sql) {
                 const char* s = p++;
                 while (p < end && ((unsigned)(unsigned char)*p - '0' < 10u || *p == '.')) ++p;
                 stmt.flat_values.push_back({s, (size_t)(p - s)});
+            } else if (end - p >= 4 && std::toupper((unsigned char)p[0]) == 'N' &&
+                       std::toupper((unsigned char)p[1]) == 'U' &&
+                       std::toupper((unsigned char)p[2]) == 'L' &&
+                       std::toupper((unsigned char)p[3]) == 'L' &&
+                       (end - p == 4 || !(std::isalnum((unsigned char)p[4]) || p[4] == '_'))) {
+                stmt.flat_values.push_back({});   // NULL = empty value in FlexQL
+                p += 4;
             } else {
                 return std::nullopt;
             }
@@ -100,11 +115,22 @@ static std::optional<InsertStmt> fast_parse_insert(const std::string& sql) {
         ++p; // ')'
 
         if (first_row) { first_row_ncols = row_val_count; first_row = false; }
+        // Every row must have the same number of values. (Previously only the
+        // first row's count was used, so a shorter later row silently shifted
+        // values between rows / dropped data.) Mismatch → full parser, which
+        // reports a proper error.
+        else if (row_val_count != first_row_ncols) return std::nullopt;
 
         while (p < end && std::isspace((unsigned char)*p)) ++p;
         if (p < end && *p == ',') { ++p; continue; }
         break;
     }
+
+    // Only an optional ';' (and whitespace) may follow the last row.
+    while (p < end && std::isspace((unsigned char)*p)) ++p;
+    if (p < end && *p == ';') ++p;
+    while (p < end && std::isspace((unsigned char)*p)) ++p;
+    if (p != end) return std::nullopt;        // trailing text → full parser reports it
 
     stmt.flat_ncols = first_row_ncols;
     return stmt;
@@ -121,7 +147,14 @@ Statement Parser::parse(const std::string& sql) {
         if (opt) return std::move(*opt);
     }
     Parser pr(tokenize(sql));
-    return pr.parse_stmt();
+    Statement st = pr.parse_stmt();
+    // Nothing but an optional ';' may follow. Previously trailing text was
+    // silently ignored: "SELECT * FROM t garbage" ran as "SELECT * FROM t",
+    // and "a; b" executed only a.
+    pr.match(TokenType::SEMICOLON);
+    if (!pr.check(TokenType::END_OF_INPUT))
+        throw ParseError("unexpected '" + tok_str(pr.peek()) + "' after end of statement");
+    return st;
 }
 
 // ── Token helpers ─────────────────────────────────────────────────────────────
@@ -282,7 +315,15 @@ InsertStmt Parser::parse_insert() {
         std::vector<std::string_view> row;
         while (!check(TokenType::RPAREN) && !check(TokenType::END_OF_INPUT)) {
             Token v = advance();
-            if (v.type == TokenType::NUMBER_LIT || v.type == TokenType::STRING_LIT) {
+            if (v.type == TokenType::STRING_LIT && v.sv.empty() && !v.value.empty()) {
+                // Escaped string ('O''Brien'): the lexer produced the unescaped
+                // text as a NEW string inside the token, which dies with the
+                // parser — keep a copy owned by the statement and view that.
+                stmt.owned.push_back(v.value);
+                row.push_back(stmt.owned.back());
+            } else if (v.type == TokenType::KW_NULL) {
+                row.push_back({});                 // NULL = empty value
+            } else if (v.type == TokenType::NUMBER_LIT || v.type == TokenType::STRING_LIT) {
                 row.push_back(v.sv);
             } else if (v.type == TokenType::IDENTIFIER) {
                 row.push_back(v.sv.empty() ? std::string_view(v.value) : v.sv);
@@ -472,35 +513,11 @@ SelectStmt Parser::parse_select() {
         stmt.distinct = true;
     }
 
-    // Aggregate function detection
-    if (check(TokenType::IDENTIFIER) &&
-        pos_ + 1 < tokens_.size() &&
-        tokens_[pos_ + 1].type == TokenType::LPAREN)
-    {
-        std::string fn = strutil::to_upper(tokens_[pos_].value);
-        if (fn == "COUNT" || fn == "SUM" || fn == "AVG" ||
-            fn == "MIN"   || fn == "MAX")
-        {
-            advance();
-            advance(); // '('
-            std::string agg_col;
-            if (check(TokenType::STAR)) {
-                advance(); agg_col = "*";
-            } else {
-                agg_col = parse_col_ref();
-            }
-            expect(TokenType::RPAREN, ")");
-            stmt.agg_func = fn;
-            stmt.agg_col  = agg_col;
-            stmt.cols     = {fn + "(" + agg_col + ")"};
-            expect(TokenType::KW_FROM, "FROM");
-            stmt.table = strutil::to_upper(
-                expect(TokenType::IDENTIFIER, "table name").value);
-            stmt.where = try_parse_where();
-            match(TokenType::SEMICOLON);
-            return stmt;
-        }
-    }
+    // (There used to be an "aggregate first" shortcut here: if the first item
+    // was COUNT/SUM/AVG/MIN/MAX(...) it parsed exactly ONE aggregate and then
+    // demanded FROM. That rejected "COUNT(*), SUM(x)", "COUNT(*) AS n", and
+    // "COUNT(*), dept ... GROUP BY dept". Every SELECT now goes through the
+    // general column list below; the executor decides how to run aggregates.)
 
     // Column list — each entry may be a plain col ref, FUNC(col/*), or expr AS alias
     if (check(TokenType::STAR)) {
@@ -546,8 +563,9 @@ SelectStmt Parser::parse_select() {
             stmt.col_aliases.push_back(alias);
         } while (match(TokenType::COMMA));
 
-        // Reset agg_func/col if we also have non-aggregate columns (GROUP BY handles it)
-        if (stmt.cols.size() > 1 || stmt.group_by.empty()) {
+        // agg_func/agg_col are informational only (the executor reads cols):
+        // keep them when the select list is exactly one aggregate.
+        if (stmt.cols.size() != 1) {
             stmt.agg_func.clear();
             stmt.agg_col.clear();
         }

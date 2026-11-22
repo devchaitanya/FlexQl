@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <cstdint>
 
 // ── Snapshot (checkpoint) for FlexQL ─────────────────────────────────────────
@@ -44,4 +45,11 @@ public:
 
     // Find the most recent snapshot in dir (returns empty SnapshotInfo if none).
     static SnapshotInfo find_latest(const std::string& dir = "data/snapshots");
+
+    // All snapshots in dir, newest (highest LSN) first.
+    static std::vector<SnapshotInfo> list_all(const std::string& dir = "data/snapshots");
+
+    // Delete all but the `keep` newest snapshots, plus leftover *.tmp files
+    // from interrupted writes. Call only after a new snapshot is durable.
+    static void prune(const std::string& dir = "data/snapshots", size_t keep = 2);
 };

@@ -4,6 +4,8 @@
 #include <string_view>
 #include <mutex>
 #include <fstream>
+#include <atomic>
+#include <vector>
 
 // ── Write-Ahead Log ───────────────────────────────────────────────────────────
 // Record format (all little-endian):
@@ -40,14 +42,43 @@ public:
     void truncate();
 
     uint64_t next_lsn() const { return next_lsn_; }
+
+    // Ensure future LSNs are > min_lsn (call after loading a snapshot, whose
+    // LSN may exceed anything left in a truncated WAL).
+    void ensure_lsn_after(uint64_t min_lsn) {
+        std::lock_guard<std::mutex> guard(mtx_);
+        if (next_lsn_ <= min_lsn) next_lsn_ = min_lsn + 1;
+    }
     uint64_t durable_lsn() const { return durable_lsn_; }
 
     bool is_open() const { return fd_ >= 0; }
 
+    // True if the WAL was open but was LOST at runtime (rotate() could not
+    // reopen any file). The server must then reject writes: accepting them
+    // would acknowledge changes that are never logged.
+    bool failed() const { return failed_.load(std::memory_order_relaxed); }
+
+    // Bytes currently in the active WAL file (drives periodic snapshots).
+    uint64_t bytes() const { return bytes_.load(std::memory_order_relaxed); }
+
+    const std::string& path() const { return path_; }
+
+    // Close the active WAL file, rename it to "<path>.<tag>.old" (a "segment"),
+    // and start a fresh empty WAL at <path>. Records written afterwards go to
+    // the new file. Returns the segment's path, or "" on failure.
+    // Caller must ensure no append() is in flight (hold the write gate).
+    std::string rotate(uint64_t tag);
+
+    // Old segments "<path>.<n>.old", sorted by n ascending (oldest first).
+    static std::vector<std::string> list_segments(const std::string& path);
+
 private:
-    int      fd_          = -1;
-    uint64_t next_lsn_    = 1;
-    uint64_t durable_lsn_ = 0;
+    int         fd_          = -1;
+    uint64_t    next_lsn_    = 1;
+    uint64_t    durable_lsn_ = 0;
+    std::string path_;
+    std::atomic<uint64_t> bytes_{0};
+    std::atomic<bool>     failed_{false};
 
     mutable std::mutex mtx_;
 

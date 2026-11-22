@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 #include <variant>
+#include <deque>
 #include <memory>
 
 // ── Predicate node ─────────────────────────────────────────────────────────────
@@ -61,6 +62,12 @@ struct InsertStmt {
     std::string                                        table;
     std::vector<std::string>                           col_list;  // optional (col1,col2) after table name
     std::vector<std::vector<std::string_view>>         rows;
+
+    // Storage for values that are NOT a plain slice of the SQL text, e.g. the
+    // unescaped 'O''Brien' → O'Brien. The views in `rows` point into these.
+    // std::deque never moves existing elements when it grows, and moving the
+    // InsertStmt moves the deque's blocks, so the views stay valid.
+    std::deque<std::string>                            owned;
 
     // ── Fast-path flat layout (populated by fast_parse_insert) ────────────────
     std::vector<std::string_view>                      flat_values;

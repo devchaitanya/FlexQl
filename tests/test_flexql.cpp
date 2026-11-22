@@ -18,6 +18,11 @@
 #include "storage/table.h"
 #include "storage/database.h"
 #include "storage/arena.h"
+#include "storage/wal.h"
+#include "cache/lru_cache.h"
+#include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "index/pk_index.h"
 #include "query/executor.h"
 #include "utils/string_utils.h"
@@ -346,26 +351,22 @@ static void test_pk_index_tombstone_duplicate() {
     CHECK(!idx.insert("a", 99), "reject duplicate a");
     CHECK_EQ((int)idx.lookup("a"), 0, "a still = 0");
 
-    // Larger test: insert N keys, remove every other, verify no false duplicates
+    // Larger test: insert N keys, remove every other, verify no false duplicates.
+    // The index stores string_views, so the key strings must outlive it
+    // (in a Table they live in the arena) — keep them all in a vector.
+    std::vector<std::string> keys;
+    for (int i = 0; i < 200; ++i) keys.push_back("key" + std::to_string(i));
     PrimaryIndex idx2;
-    for (int i = 0; i < 200; ++i) {
-        std::string key = "key" + std::to_string(i);
-        CHECK(idx2.insert(key, (size_t)i), "insert " + key);
-    }
-    for (int i = 0; i < 200; i += 2) {
-        std::string key = "key" + std::to_string(i);
-        idx2.remove(key);
-    }
+    for (int i = 0; i < 200; ++i)
+        CHECK(idx2.insert(keys[i], (size_t)i), "insert " + keys[i]);
+    for (int i = 0; i < 200; i += 2)
+        idx2.remove(keys[i]);
     // Re-insert removed keys — should succeed
-    for (int i = 0; i < 200; i += 2) {
-        std::string key = "key" + std::to_string(i);
-        CHECK(idx2.insert(key, (size_t)(i + 1000)), "re-insert " + key);
-    }
+    for (int i = 0; i < 200; i += 2)
+        CHECK(idx2.insert(keys[i], (size_t)(i + 1000)), "re-insert " + keys[i]);
     // Try duplicating the non-removed keys — must fail
-    for (int i = 1; i < 200; i += 2) {
-        std::string key = "key" + std::to_string(i);
-        CHECK(!idx2.insert(key, 9999), "reject dup " + key);
-    }
+    for (int i = 1; i < 200; i += 2)
+        CHECK(!idx2.insert(keys[i], 9999), "reject dup " + keys[i]);
 }
 
 static void test_pk_index_update() {
@@ -575,7 +576,9 @@ static void test_table_compact() {
         tbl.delete_rows(&pred);
     }
 
-    tbl.compact();
+    // Only 25 dead rows (< COMPACT_MIN_GARBAGE) → a normal sweep skips it
+    CHECK(!tbl.compact(), "compact skipped: too little garbage");
+    CHECK(tbl.compact(/*force=*/true), "forced compact rebuilds");
 
     auto res = tbl.scan({"*"}, nullptr, {});
     CHECK_EQ((int)res.num_rows(), 25, "25 rows after compact");
@@ -584,6 +587,286 @@ static void test_table_compact() {
     auto pred = Predicate::leaf("ID", "=", "1");
     res = tbl.scan({"V"}, &pred, {});
     CHECK(res.ok && res.num_rows() > 0, "PK lookup after compact");
+}
+
+static void test_table_compact_threshold() {
+    SECTION("Table: compaction threshold (garbage >= 1000 and >= 20%)");
+    TableSchema schema;
+    schema.table_name = "CT";
+    schema.columns = {{"ID", ColumnType::INT, false, false},
+                      {"V", ColumnType::TEXT, false, false}};
+    Table tbl(schema);
+    for (int i = 0; i < 10000; ++i)
+        tbl.insert({std::to_string(i), "v"}, 0);
+
+    // 1500 dead of 10000 = 15% → skip
+    auto p1 = Predicate::leaf("ID", "<", "1500");
+    CHECK_EQ(tbl.delete_rows(&p1), 1500, "deleted 1500");
+    CHECK(!tbl.compact(), "15% garbage: skipped");
+
+    // 2500 dead of 10000 = 25% → rebuild
+    auto p2 = Predicate::leaf("ID", "<", "2500");
+    CHECK_EQ(tbl.delete_rows(&p2), 1000, "deleted 1000 more");
+    CHECK(tbl.compact(), "25% garbage: compacted");
+    CHECK_EQ((int)tbl.count_rows(nullptr), 7500, "7500 live rows remain");
+    CHECK(!tbl.compact(), "counters reset: nothing left to compact");
+
+    // Expired rows count as garbage: 3000 already-expired of 10500 ≈ 29%
+    for (int i = 0; i < 3000; ++i)
+        tbl.insert({std::to_string(100000 + i), "old"}, /*expires_at=*/1);
+    CHECK(tbl.compact(), "expired rows trigger compaction");
+    CHECK_EQ((int)tbl.count_rows(nullptr), 7500, "expired rows removed");
+
+    // A deleted TTL row must not be counted twice (dead + expired):
+    // 1200 future-TTL rows, delete them → 1200 garbage of 8700 ≈ 14% → skip
+    const int64_t future = (int64_t)std::time(nullptr) + 3600;
+    for (int i = 0; i < 1200; ++i)
+        tbl.insert({std::to_string(200000 + i), "ttl"}, future);
+    auto p3 = Predicate::leaf("ID", ">=", "200000");
+    CHECK_EQ(tbl.delete_rows(&p3), 1200, "deleted 1200 TTL rows");
+    CHECK(!tbl.compact(), "deleted TTL rows counted once: skipped");
+
+    // TRUNCATE resets the counters
+    tbl.truncate();
+    CHECK(!tbl.compact(), "nothing to compact after truncate");
+}
+
+// ── Tiered compaction ─────────────────────────────────────────────────────────
+static TableSchema kv_schema(const char* name, bool pk) {
+    TableSchema s;
+    s.table_name = name;
+    s.columns = {{"ID", ColumnType::INT, pk, false},
+                 {"DATA", ColumnType::TEXT, false, false}};
+    s.pk_col_index = pk ? 0 : -1;
+    return s;
+}
+static std::string val_for(int id) { return "v" + std::to_string(id) + std::string(180, 'x'); }
+static std::string get_data(Table& t, int id) {
+    auto p = Predicate::leaf("ID", "=", std::to_string(id));
+    auto r = t.scan({"DATA"}, &p, {});
+    return r.num_rows() == 1 ? std::string(r.cell(0, 0)) : std::string("<missing>");
+}
+
+static void test_arena_page_accounting() {
+    SECTION("StringArena: per-page live bytes + dead page queue");
+    StringArena a;
+    std::vector<std::string_view> v;
+    for (int i = 0; i < 4096; ++i) v.push_back(a.intern(std::string(100, 'a' + i % 26)));
+    CHECK_EQ(a.live_bytes(), (size_t)409600, "live bytes after intern");
+    for (int i = 0; i < 2048; ++i) a.release(v[i]);         // first half dead
+    CHECK_EQ(a.live_bytes(), (size_t)204800, "live bytes after release");
+    auto pages = a.take_dead_pages();
+    CHECK(pages.size() >= 45, "~50 fully-dead pages queued (got " + std::to_string(pages.size()) + ")");
+    size_t freed = StringArena::madvise_pages(pages);
+    a.add_released(freed);
+    CHECK(a.released_bytes() >= 45 * 4096, "released bytes counted");
+    // Surviving strings are intact (their pages were not released)
+    bool ok = true;
+    for (int i = 2048; i < 4096; ++i)
+        if (v[i] != std::string(100, 'a' + i % 26)) { ok = false; break; }
+    CHECK(ok, "live strings intact after madvise of dead pages");
+    CHECK(a.take_dead_pages().empty(), "queue empty after handover");
+}
+
+static void test_tier2_page_release() {
+    SECTION("Compaction tier 1+2: time-ordered deletes release pages, no rebuild");
+    Table t(kv_schema("T2", false));
+    for (int i = 0; i < 30000; ++i) t.insert({std::to_string(i), val_for(i)}, 0);
+    auto before = t.arena_stats();
+    auto p = Predicate::leaf("ID", "<", "18000");             // oldest 60%
+    CHECK_EQ(t.delete_rows(&p), 18000, "deleted oldest 60%");
+    auto r = t.sweep();
+    CHECK(r.rows_compacted, "tier 1 ran");
+    CHECK(r.bytes_released > 0, "tier 2 released pages");
+    CHECK(!r.arena_rebuilt, "tier 3 not needed (waste below limits)");
+    auto after = t.arena_stats();
+    CHECK(after.resident < before.resident * 6 / 10,
+          "resident arena dropped ~60% (" + std::to_string(before.resident >> 10) + " KB → " +
+          std::to_string(after.resident >> 10) + " KB)");
+    CHECK_EQ((int)t.count_rows(nullptr), 12000, "12000 live rows");
+    CHECK_STR_EQ(get_data(t, 25000), val_for(25000), "surviving row data intact");
+}
+
+static void test_tier3_rebuild_scattered() {
+    SECTION("Compaction tier 3: scattered deletes → rebuild aside + swap");
+    Table t(kv_schema("T3", true));
+    Table::CompactionLimits lim;
+    lim.min_waste_bytes = 1 << 20;                            // 1 MB for the test
+    t.set_compaction_limits(lim);
+    for (int i = 0; i < 30000; ++i) t.insert({std::to_string(i), val_for(i)}, 0);
+    for (int i = 0; i < 30000; i += 4) {                       // keep 1 in 4
+        for (int k = 1; k < 4; ++k) {
+            auto p = Predicate::leaf("ID", "=", std::to_string(i + k));
+            t.delete_rows(&p);
+        }
+    }
+    auto before = t.arena_stats();
+    auto r = t.sweep();
+    CHECK(r.rows_compacted, "tier 1 ran");
+    CHECK(r.arena_rebuilt, "tier 3 rebuilt the arena (dead bytes scattered)");
+    auto after = t.arena_stats();
+    CHECK(after.resident < before.resident / 2, "resident arena shrank");
+    CHECK_EQ((int)t.count_rows(nullptr), 7500, "7500 live rows");
+    CHECK_STR_EQ(get_data(t, 2000), val_for(2000), "PK lookup after rebuild");
+    CHECK_STR_EQ(get_data(t, 2001), std::string("<missing>"), "deleted row stays deleted");
+}
+
+static void test_tier3_patching() {
+    SECTION("Compaction tier 3: writes in the gap are patched into the copy");
+    Table t(kv_schema("TP", true));
+    for (int i = 0; i < 2000; ++i) t.insert({std::to_string(i), val_for(i)}, 0);
+    for (int i = 0; i < 2000; i += 2) {
+        auto p = Predicate::leaf("ID", "=", std::to_string(i));
+        t.delete_rows(&p);
+    }
+    t.set_rebuild_gap_hook([&] {
+        auto u = Predicate::leaf("ID", "=", "101");
+        t.update_rows({{"DATA", "updated-in-gap"}}, &u);       // UPDATE
+        auto d = Predicate::leaf("ID", "=", "103");
+        t.delete_rows(&d);                                     // DELETE
+        t.insert({"5000", "inserted-in-gap"}, 0);              // INSERT
+        auto k = Predicate::leaf("ID", "=", "105");
+        t.update_rows({{"ID", "7000"}}, &k);                   // PK change
+    });
+    auto r = t.sweep(nullptr, /*force=*/true);
+    t.set_rebuild_gap_hook(nullptr);
+    CHECK(r.arena_rebuilt, "rebuild completed with patching");
+    CHECK_STR_EQ(get_data(t, 101), std::string("updated-in-gap"), "gap UPDATE kept");
+    CHECK_STR_EQ(get_data(t, 103), std::string("<missing>"), "gap DELETE kept");
+    CHECK_STR_EQ(get_data(t, 5000), std::string("inserted-in-gap"), "gap INSERT kept");
+    CHECK_STR_EQ(get_data(t, 7000), val_for(105), "gap PK change: new key found");
+    CHECK_STR_EQ(get_data(t, 105), std::string("<missing>"), "gap PK change: old key gone");
+    CHECK_EQ((int)t.count_rows(nullptr), 1000, "row count after patch (1000 -1 +1)");
+
+    // TRUNCATE in the gap aborts the rebuild safely
+    for (int i = 0; i < 100; ++i) t.insert({std::to_string(10000 + i), "z"}, 0);
+    t.set_rebuild_gap_hook([&] { t.truncate(); });
+    r = t.sweep(nullptr, true);
+    t.set_rebuild_gap_hook(nullptr);
+    CHECK(!r.arena_rebuilt, "TRUNCATE in the gap aborts the rebuild");
+    CHECK_EQ((int)t.count_rows(nullptr), 0, "table empty after truncate");
+    t.insert({"1", "after"}, 0);
+    CHECK_STR_EQ(get_data(t, 1), std::string("after"), "table usable after aborted rebuild");
+}
+
+static void test_update_pk_rekey() {
+    SECTION("UPDATE of the PK column re-keys the index");
+    Table t(kv_schema("PKU", true));
+    for (int i = 0; i < 10; ++i) t.insert({std::to_string(i), "d" + std::to_string(i)}, 0);
+    auto p = Predicate::leaf("ID", "=", "5");
+    CHECK_EQ(t.update_rows({{"ID", "500"}}, &p), 1, "updated 1 row");
+    CHECK_STR_EQ(get_data(t, 500), std::string("d5"), "found by new key");
+    CHECK_STR_EQ(get_data(t, 5), std::string("<missing>"), "old key gone");
+}
+
+static void test_pk_index_tombstone_churn_and_remap() {
+    SECTION("PrimaryIndex: tombstone churn never fills the table; remap_rows");
+    // Insert+remove many DISTINCT keys: every remove leaves a tombstone. If the
+    // load check ignored tombstones, slots would fill up and insert() would
+    // probe forever. (Keys must outlive the index — it stores views.)
+    std::vector<std::string> keys;
+    for (int i = 0; i < 5000; ++i) keys.push_back("k" + std::to_string(i));
+    PrimaryIndex idx;
+    for (int i = 0; i < 5000; ++i) {
+        idx.insert(keys[i], (size_t)i);
+        if (i >= 3) idx.remove(keys[i - 3]);           // keep only 3 live keys
+    }
+    CHECK_EQ((int)idx.size(), 3, "3 live keys after churn (no hang)");
+    CHECK_EQ((int)idx.lookup(keys[4999]), 4999, "latest key found");
+
+    // remap_rows: rows 0..9, drop 3 and 7, the rest slide down
+    PrimaryIndex r;
+    std::vector<std::string> rk;
+    for (int i = 0; i < 10; ++i) rk.push_back("r" + std::to_string(i));
+    for (int i = 0; i < 10; ++i) r.insert(rk[i], (size_t)i);
+    std::vector<uint32_t> remap(10);
+    uint32_t w = 0;
+    for (int i = 0; i < 10; ++i) remap[i] = (i == 3 || i == 7) ? PrimaryIndex::DROPPED : w++;
+    r.remap_rows(remap);
+    CHECK_EQ((int)r.size(), 8, "2 keys dropped");
+    CHECK_EQ((int)r.lookup(rk[3]), -1, "dropped key gone");
+    CHECK_EQ((int)r.lookup(rk[9]), 7, "row 9 → 7");
+    CHECK_EQ((int)r.lookup(rk[5]), 4, "row 5 → 4");
+    CHECK(r.insert(rk[3], 42), "dropped key can be re-inserted");
+}
+
+static void test_pk_index_compact_if_sparse() {
+    SECTION("PrimaryIndex: compact_if_sparse drops tombstones and shrinks");
+    std::vector<std::string> keys;
+    for (int i = 0; i < 20000; ++i) keys.push_back("p" + std::to_string(i));
+    PrimaryIndex idx;
+    for (int i = 0; i < 20000; ++i) idx.insert(keys[i], (size_t)i);
+    for (int i = 0; i < 18000; ++i) idx.remove(keys[i]);           // 90% deleted
+    const size_t cap_before = idx.capacity();
+    CHECK_EQ((int)idx.tombstones(), 18000, "18000 tombstones");
+    CHECK(idx.compact_if_sparse(), "rebuilt (tombstones > live)");
+    CHECK_EQ((int)idx.tombstones(), 0, "tombstones dropped");
+    CHECK(idx.capacity() < cap_before / 4, "slot array shrank (" + std::to_string(cap_before) +
+          " → " + std::to_string(idx.capacity()) + ")");
+    CHECK_EQ((int)idx.lookup(keys[19999]), 19999, "live key still found");
+    CHECK_EQ((int)idx.lookup(keys[5]), -1, "deleted key still absent");
+    CHECK(!idx.compact_if_sparse(), "no-op when tombstones <= live");
+}
+
+static void test_compaction_expired_pk() {
+    SECTION("Compaction: expired PK rows' keys leave the index");
+    Table t(kv_schema("EPK", true));
+    for (int i = 0; i < 2000; ++i) t.insert({std::to_string(i), "old"}, /*expires_at=*/1);
+    for (int i = 2000; i < 2500; ++i) t.insert({std::to_string(i), "live"}, 0);
+    CHECK(t.compact(), "expired rows compacted");
+    CHECK_EQ((int)t.count_rows(nullptr), 500, "500 live rows");
+    CHECK(t.insert({"7", "reborn"}, 0).empty(), "expired key reusable after compaction");
+    CHECK_STR_EQ(get_data(t, 7), std::string("reborn"), "re-inserted row found");
+    CHECK_STR_EQ(get_data(t, 2400), std::string("live"), "moved row found via remapped index");
+}
+
+static void test_compaction_concurrent() {
+    SECTION("Compaction under concurrent writers (no lost writes)");
+    Table t(kv_schema("TC", true));
+    Table::CompactionLimits lim;
+    lim.min_garbage_rows = 1;
+    lim.min_waste_bytes  = 1;
+    t.set_compaction_limits(lim);
+    constexpr int THREADS = 3, KEYS = 600, OPS = 4000;
+    std::vector<std::vector<std::string>> expect(THREADS, std::vector<std::string>(KEYS));
+    std::atomic<bool> done{false};
+    std::vector<std::thread> ws;
+    for (int w = 0; w < THREADS; ++w) {
+        ws.emplace_back([&, w] {
+            uint32_t seed = 12345u + (uint32_t)w;
+            auto rnd = [&] { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+            for (int op = 0; op < OPS; ++op) {
+                const int k  = (int)(rnd() % KEYS);
+                const int id = w * 100000 + k;
+                auto p = Predicate::leaf("ID", "=", std::to_string(id));
+                std::string& e = expect[w][k];
+                const std::string nv = "w" + std::to_string(w) + "-" + std::to_string(op) +
+                                       std::string(rnd() % 120, 'y');
+                const uint32_t action = rnd() % 3;
+                if (e.empty())          { t.insert({std::to_string(id), nv}, 0); e = nv; }
+                else if (action == 0)   { t.delete_rows(&p); e.clear(); }
+                else                    { t.update_rows({{"DATA", nv}}, &p); e = nv; }
+            }
+        });
+    }
+    std::thread sweeper([&] {
+        while (!done) t.sweep(nullptr, /*force=*/true);       // all tiers, repeatedly
+    });
+    for (auto& th : ws) th.join();
+    done = true;
+    sweeper.join();
+    t.sweep(nullptr, true);
+
+    int bad = 0, live = 0;
+    for (int w = 0; w < THREADS; ++w)
+        for (int k = 0; k < KEYS; ++k) {
+            const std::string got = get_data(t, w * 100000 + k);
+            const std::string& e = expect[w][k];
+            if (!e.empty()) ++live;
+            if ((e.empty() && got != "<missing>") || (!e.empty() && got != e)) ++bad;
+        }
+    CHECK_EQ(bad, 0, "every key matches the reference model");
+    CHECK_EQ((int)t.count_rows(nullptr), live, "row count matches");
 }
 
 static void test_table_flat_insert_batch() {
@@ -757,6 +1040,247 @@ static void test_executor_aggregate() {
     r = exec.execute(Parser::parse("SELECT MAX(val) FROM agg;"));
     CHECK(r.ok && !r.rows.empty(), "MAX ok");
     if (!r.rows.empty()) CHECK_STR_EQ(r.rows[0][0], std::string("50"), "MAX = 50");
+}
+
+// Run one SELECT and return "col=val, col=val | col=val ..." (rows separated by
+// " | ") or "ERROR: ..." — compact enough to compare whole results in one CHECK.
+static std::string q(Executor& ex, const std::string& sql) {
+    QueryResult r;
+    try { r = ex.execute(Parser::parse(sql)); }
+    catch (const std::exception& e) { return std::string("PARSE ERROR: ") + e.what(); }
+    if (!r.ok) return "ERROR: " + r.error;
+    std::string out;
+    for (size_t i = 0; i < r.num_rows(); ++i) {
+        if (i) out += " | ";
+        for (size_t c = 0; c < r.column_names.size(); ++c) {
+            if (c) out += ", ";
+            out += r.column_names[c] + "=" + std::string(r.cell(i, c));
+        }
+    }
+    return out;
+}
+
+static void test_executor_aggregates_general() {
+    SECTION("Executor: multiple aggregates, aliases, NULLs, errors");
+    reset_database();
+    Executor ex;
+    ex.execute(Parser::parse("CREATE TABLE emp (id INT PRIMARY KEY, dept VARCHAR, salary INT, bonus DECIMAL);"));
+    ex.execute(Parser::parse("INSERT INTO emp VALUES (1,'ENG',100,1.5),(2,'ENG',200,''),(3,'HR',50,2.25);"));
+
+    // Several aggregates in one statement, no GROUP BY → one row
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), SUM(salary), AVG(salary), MIN(salary), MAX(salary) FROM emp;"),
+                 std::string("COUNT(*)=3, SUM(SALARY)=350, AVG(SALARY)=116.666666666667, MIN(SALARY)=50, MAX(SALARY)=200"),
+                 "5 aggregates in one SELECT");
+    // Aliases + WHERE
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*) AS n, SUM(salary) AS total FROM emp WHERE salary > 60;"),
+                 std::string("N=2, TOTAL=300"), "aliases + WHERE");
+    // NULL rules: COUNT(*) counts rows, COUNT(col) skips NULL, SUM/AVG skip NULL; decimals exact
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), COUNT(bonus), SUM(bonus), AVG(bonus) FROM emp;"),
+                 std::string("COUNT(*)=3, COUNT(BONUS)=2, SUM(BONUS)=3.75, AVG(BONUS)=1.875"),
+                 "NULL skipped, decimal SUM/AVG");
+    // Empty input: COUNT 0, others NULL (empty)
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), SUM(salary), MIN(salary) FROM emp WHERE salary > 1000;"),
+                 std::string("COUNT(*)=0, SUM(SALARY)=, MIN(SALARY)="), "aggregates over zero rows");
+    // MIN/MAX on text compare as strings
+    CHECK_STR_EQ(q(ex, "SELECT MIN(dept), MAX(dept) FROM emp;"),
+                 std::string("MIN(DEPT)=ENG, MAX(DEPT)=HR"), "MIN/MAX on text");
+    // Errors that used to be parse errors or misleading messages
+    CHECK(q(ex, "SELECT dept, SUM(salary) FROM emp;").find("must appear in GROUP BY") != std::string::npos,
+          "plain column + aggregate without GROUP BY → clear error");
+    CHECK(q(ex, "SELECT SUM(dept) FROM emp;").find("requires a numeric column") != std::string::npos,
+          "SUM of text column → error");
+    CHECK(q(ex, "SELECT SUM(*) FROM emp;").find("only COUNT(*)") != std::string::npos,
+          "SUM(*) → error");
+    // Single COUNT(*) still uses the fast count path and still parses as before
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*) FROM emp WHERE salary >= 100;"),
+                 std::string("COUNT(*)=2"), "single COUNT(*) with WHERE");
+}
+
+static void test_executor_group_by() {
+    SECTION("Executor: GROUP BY with multiple aggregates (any order) + HAVING");
+    reset_database();
+    Executor ex;
+    ex.execute(Parser::parse("CREATE TABLE emp (id INT PRIMARY KEY, dept VARCHAR, salary INT, bonus DECIMAL);"));
+    ex.execute(Parser::parse("INSERT INTO emp VALUES (1,'ENG',100,1.5),(2,'ENG',200,''),(3,'HR',50,2.25);"));
+
+    CHECK_STR_EQ(q(ex, "SELECT dept, COUNT(*), SUM(salary), MAX(salary) FROM emp GROUP BY dept;"),
+                 std::string("DEPT=ENG, COUNT(*)=2, SUM(SALARY)=300, MAX(SALARY)=200 | "
+                             "DEPT=HR, COUNT(*)=1, SUM(SALARY)=50, MAX(SALARY)=50"),
+                 "GROUP BY with 3 aggregates, exact integer SUM");
+    // Aggregate listed FIRST used to be a parse error
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), dept FROM emp GROUP BY dept;"),
+                 std::string("COUNT(*)=2, DEPT=ENG | COUNT(*)=1, DEPT=HR"), "aggregate first in GROUP BY");
+    // COUNT(col) skips NULLs per group
+    CHECK_STR_EQ(q(ex, "SELECT dept, COUNT(bonus) FROM emp GROUP BY dept;"),
+                 std::string("DEPT=ENG, COUNT(BONUS)=1 | DEPT=HR, COUNT(BONUS)=1"), "COUNT(col) per group skips NULL");
+    // HAVING on an aggregate
+    CHECK_STR_EQ(q(ex, "SELECT dept, SUM(salary) FROM emp GROUP BY dept HAVING SUM(salary) > 100;"),
+                 std::string("DEPT=ENG, SUM(SALARY)=300"), "HAVING filters groups");
+}
+
+static void test_lru_cache_concurrent() {
+    SECTION("LRU cache: values stay valid while other threads evict them");
+    // Tiny capacity + constant put/invalidate → entries are evicted all the
+    // time while readers copy them. With the old raw-pointer get() this was a
+    // use-after-free (ASAN catches it); with shared_ptr copies it is safe.
+    LRUCache<std::string, std::string> cache(2);
+    const std::string big(4096, 'x');
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0}, bad{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 3; ++t)
+        ts.emplace_back([&, t] {
+            while (!stop) {
+                if (auto v = cache.get("k" + std::to_string(t % 3))) {
+                    std::string copy = *v;                 // copy after the lock is released
+                    if (copy.size() != big.size()) ++bad;
+                    ++reads;
+                }
+            }
+        });
+    ts.emplace_back([&] {
+        for (int i = 0; i < 20000; ++i) {
+            cache.put("k" + std::to_string(i % 3), big, "T");
+            if (i % 7 == 0) cache.invalidate_prefix("T");
+        }
+        stop = true;
+    });
+    for (auto& th : ts) th.join();
+    CHECK_EQ((long)bad, 0L, "every value read intact");
+    CHECK(reads > 0, "readers actually hit the cache");
+}
+
+static void test_self_join() {
+    SECTION("JOIN: self-join locks the table once");
+    reset_database();
+    Executor ex;
+    ex.execute(Parser::parse("CREATE TABLE emp (id INT PRIMARY KEY, mgr INT);"));
+    ex.execute(Parser::parse("INSERT INTO emp VALUES (1,0),(2,1),(3,1);"));
+    auto r = ex.execute(Parser::parse("SELECT * FROM emp INNER JOIN emp ON emp.mgr = emp.id;"));
+    CHECK(r.ok, "self-join runs (no double lock)");
+    CHECK_EQ((int)r.num_rows(), 2, "employees 2 and 3 match manager 1");
+}
+
+static void test_group_by_vectorized_and_join() {
+    SECTION("GROUP BY from the table, hidden HAVING aggregates, aggregates over JOIN");
+    reset_database();
+    Executor ex;
+    ex.execute(Parser::parse("CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, team VARCHAR, salary INT);"));
+    ex.execute(Parser::parse("INSERT INTO emp VALUES (1,10,'a',100),(2,10,'b',200),(3,20,'a',50),(4,10,'a',300),(5,30,'c',NULL);"));
+    ex.execute(Parser::parse("CREATE TABLE dept (did INT PRIMARY KEY, dname VARCHAR);"));
+    ex.execute(Parser::parse("INSERT INTO dept VALUES (10,'ENG'),(20,'HR'),(40,'OPS');"));
+
+    // Integer group key → the int64 hash fast path
+    CHECK_STR_EQ(q(ex, "SELECT dept_id, COUNT(*), SUM(salary), AVG(salary) FROM emp GROUP BY dept_id;"),
+                 std::string("DEPT_ID=10, COUNT(*)=3, SUM(SALARY)=600, AVG(SALARY)=200 | "
+                             "DEPT_ID=20, COUNT(*)=1, SUM(SALARY)=50, AVG(SALARY)=50 | "
+                             "DEPT_ID=30, COUNT(*)=1, SUM(SALARY)=, AVG(SALARY)="),
+                 "int key; NULL-only group gives NULL sum/avg");
+    // Two group columns → string-key path (length-prefixed keys)
+    CHECK_STR_EQ(q(ex, "SELECT dept_id, team, COUNT(*) FROM emp WHERE dept_id = 10 GROUP BY dept_id, team;"),
+                 std::string("DEPT_ID=10, TEAM=a, COUNT(*)=2 | DEPT_ID=10, TEAM=b, COUNT(*)=1"),
+                 "multi-column group key + WHERE");
+    // HAVING on an aggregate that is NOT selected (used to drop every group)
+    CHECK_STR_EQ(q(ex, "SELECT dept_id FROM emp GROUP BY dept_id HAVING COUNT(*) > 1;"),
+                 std::string("DEPT_ID=10"), "HAVING on a hidden aggregate");
+    // HAVING via the alias, LIMIT/OFFSET on groups
+    CHECK_STR_EQ(q(ex, "SELECT dept_id, SUM(salary) AS total FROM emp GROUP BY dept_id HAVING total >= 50 LIMIT 1 OFFSET 1;"),
+                 std::string("DEPT_ID=20, TOTAL=50"), "HAVING by alias + OFFSET/LIMIT");
+    CHECK(q(ex, "SELECT team, COUNT(*) FROM emp GROUP BY dept_id;").find("must appear in GROUP BY") != std::string::npos,
+          "non-grouped column → error");
+
+    // Aggregates over a JOIN, no GROUP BY → one row
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), SUM(emp.salary), MAX(dept.dname) FROM emp INNER JOIN dept ON emp.dept_id = dept.did;"),
+                 std::string("COUNT(*)=4, SUM(EMP.SALARY)=650, MAX(DEPT.DNAME)=HR"), "aggregates over JOIN");
+    // GROUP BY over a JOIN
+    CHECK_STR_EQ(q(ex, "SELECT dname, COUNT(*), SUM(salary) FROM emp INNER JOIN dept ON emp.dept_id = dept.did GROUP BY dname;"),
+                 std::string("DNAME=ENG, COUNT(*)=3, SUM(SALARY)=600 | DNAME=HR, COUNT(*)=1, SUM(SALARY)=50"),
+                 "GROUP BY over JOIN (unqualified names resolved)");
+    // Zero joined rows, no GROUP BY → still one row
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), SUM(salary) FROM emp INNER JOIN dept ON emp.dept_id = dept.did WHERE salary > 1000;"),
+                 std::string("COUNT(*)=0, SUM(SALARY)="), "aggregate over empty JOIN = one row");
+    // JOIN LIMIT/OFFSET used to be ignored; DESC with ties must be well-defined
+    auto r = ex.execute(Parser::parse("SELECT emp.id FROM emp INNER JOIN dept ON emp.dept_id = dept.did ORDER BY emp.dept_id DESC LIMIT 2;"));
+    CHECK(r.ok && r.num_rows() == 2, "JOIN LIMIT applied");
+    if (r.ok && r.num_rows() == 2) CHECK_STR_EQ(std::string(r.cell(0, 0)), std::string("3"), "DESC: HR (20) first");
+}
+
+static void test_parser_fixes() {
+    SECTION("Parser: row-length mismatch, NULL, escaped quotes, trailing text");
+    reset_database();
+    Executor ex;
+    ex.execute(Parser::parse("CREATE TABLE p (id INT, name VARCHAR, score INT);"));
+
+    // Rows with different value counts used to be silently mangled by the
+    // fast path (only the first row's count was used). Now: a clear error.
+    auto r = ex.execute(Parser::parse("INSERT INTO p VALUES (1,'a',10),(2,'b');"));
+    CHECK(!r.ok, "row with fewer values is rejected");
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*) FROM p;"), std::string("COUNT(*)=0"), "nothing inserted");
+
+    // NULL literal: fast path (unquoted NULL) and full parser (an escaped quote
+    // in the same statement forces the slow path)
+    r = ex.execute(Parser::parse("INSERT INTO p VALUES (1,'a',NULL),(2,NULL,20);"));
+    CHECK(r.ok, "NULL accepted by the fast path");
+    r = ex.execute(Parser::parse("INSERT INTO p VALUES (3,'c''',null);"));
+    CHECK(r.ok, "NULL accepted by the full parser");
+    CHECK_STR_EQ(q(ex, "SELECT COUNT(*), COUNT(name), COUNT(score) FROM p;"),
+                 std::string("COUNT(*)=3, COUNT(NAME)=2, COUNT(SCORE)=1"), "NULLs stored as NULL");
+
+    // Escaped quotes: 'O''Brien' = O'Brien, in INSERT and in WHERE
+    r = ex.execute(Parser::parse("INSERT INTO p VALUES (4,'O''Brien',1),(5,'it''s ''quoted''',2);"));
+    CHECK(r.ok, "escaped quotes accepted");
+    CHECK_STR_EQ(q(ex, "SELECT name FROM p WHERE id = 4;"), std::string("NAME=O'Brien"), "unescaped on insert");
+    CHECK_STR_EQ(q(ex, "SELECT name FROM p WHERE id = 5;"), std::string("NAME=it's 'quoted'"), "multiple escapes");
+    CHECK_STR_EQ(q(ex, "SELECT id FROM p WHERE name = 'O''Brien';"), std::string("ID=4"), "escaped literal in WHERE");
+
+    // Trailing text is an error now (used to be silently ignored)
+    CHECK(q(ex, "SELECT * FROM p garbage;").find("PARSE ERROR") == 0, "trailing word → parse error");
+    CHECK(q(ex, "SELECT * FROM p; SELECT * FROM p;").find("PARSE ERROR") == 0, "two statements → parse error");
+    bool threw = false;
+    try { Parser::parse("INSERT INTO p VALUES (6,'f',6) junk;"); } catch (const ParseError&) { threw = true; }
+    CHECK(threw, "trailing text after INSERT → parse error");
+    CHECK(q(ex, "SELECT COUNT(*) FROM p;   ").find("COUNT(*)=") == 0, "trailing whitespace is fine");
+}
+
+static void test_wal_rotate() {
+    SECTION("WAL: rotate splits the log; a failed rotate keeps the WAL usable");
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("flexql_wal_test_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string path = (dir / "wal.log").string();
+    {
+        WalWriter w;
+        CHECK(w.open(path), "open");
+        w.append("INSERT INTO t VALUES (1);");
+        w.append("INSERT INTO t VALUES (2);");
+        const std::string seg = w.rotate(2);
+        CHECK(!seg.empty() && fs::exists(seg), "rotate created the segment");
+        CHECK(w.is_open() && !w.failed() && w.bytes() == 0, "fresh empty wal.log after rotate");
+        w.append("INSERT INTO t VALUES (3);");
+        // Records 1,2 in the segment, 3 in the new file, LSNs continue
+        WalReader r1; uint64_t lsn; std::string sql; int n1 = 0;
+        CHECK(r1.open(seg), "segment readable");
+        while (r1.read_next(lsn, sql)) ++n1;
+        WalReader r2; int n2 = 0; uint64_t last = 0;
+        CHECK(r2.open(path), "new wal readable");
+        while (r2.read_next(lsn, sql)) { ++n2; last = lsn; }
+        CHECK(n1 == 2 && n2 == 1 && last == 3, "segment has 2 records, new file has LSN 3");
+
+        // Failure path: a read-only directory makes the rename fail.
+        // The WAL must stay OPEN on the same file (not silently closed).
+        ::chmod(dir.c_str(), 0555);
+        const bool root = (::geteuid() == 0);      // root ignores permissions; skip then
+        if (!root) {
+            CHECK(w.rotate(9).empty(), "rotate fails in a read-only dir");
+            CHECK(w.is_open() && !w.failed(), "WAL still open after a failed rotate");
+            const uint64_t before = w.bytes();
+            w.append("INSERT INTO t VALUES (4);");
+            CHECK(w.bytes() > before, "appends still land in the log");
+        }
+        ::chmod(dir.c_str(), 0755);
+    }
+    fs::remove_all(dir);
 }
 
 static void test_executor_delete_update() {
@@ -1118,6 +1642,16 @@ int main() {
     test_table_update();
     test_table_truncate();
     test_table_compact();
+    test_table_compact_threshold();
+    test_arena_page_accounting();
+    test_tier2_page_release();
+    test_tier3_rebuild_scattered();
+    test_tier3_patching();
+    test_update_pk_rekey();
+    test_pk_index_tombstone_churn_and_remap();
+    test_pk_index_compact_if_sparse();
+    test_compaction_expired_pk();
+    test_compaction_concurrent();
     test_table_flat_insert_batch();
     test_table_where_operators();
 
@@ -1125,7 +1659,14 @@ int main() {
     test_executor_create_insert_select();
     test_executor_inner_join();
     test_executor_left_join();
+    test_lru_cache_concurrent();
+    test_self_join();
+    test_group_by_vectorized_and_join();
+    test_parser_fixes();
+    test_wal_rotate();
     test_executor_aggregate();
+    test_executor_aggregates_general();
+    test_executor_group_by();
     test_executor_delete_update();
     test_executor_errors();
 

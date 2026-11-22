@@ -48,8 +48,22 @@ std::string Database::drop_table(const std::string& name, bool if_exists) {
     return "";
 }
 
-void Database::compact_all() {
-    std::shared_lock lock(registry_mtx_);
-    for (auto& [name, tbl] : tables_)
-        tbl->compact();
+size_t Database::compact_all() {
+    // Take the table list, then release the registry lock so CREATE/DROP are
+    // not blocked for the whole sweep (shared_ptr keeps a dropped table alive
+    // until we are done with it).
+    std::vector<std::shared_ptr<Table>> tbls;
+    {
+        std::shared_lock lock(registry_mtx_);
+        tbls.reserve(tables_.size());
+        for (auto& [name, tbl] : tables_) tbls.push_back(tbl);
+    }
+    size_t touched = 0;
+    for (auto& tbl : tbls) {
+        // The write gate is held (shared) only around each table's exclusive
+        // phases, so a periodic snapshot never waits for a whole sweep.
+        Table::SweepResult r = tbl->sweep(&write_gate_);
+        if (r.rows_compacted || r.bytes_released || r.arena_rebuilt) ++touched;
+    }
+    return touched;
 }

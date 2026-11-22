@@ -42,3 +42,14 @@ docs/*.pdf
 *~
 FlexQl.pdf
 bench/benchmark_full
+
+# Personal interview/revision notes (kept local)
+INTERVIEW_NOTES.md
+INTERVIEW_CONCEPTS.md
+LEARNING_PROMPT.md
+REVISION_NOTES.md
+REVISION_NOTES.pdf
+
+# Compiled bench binaries
+bench/server
+bench/new_benchmark

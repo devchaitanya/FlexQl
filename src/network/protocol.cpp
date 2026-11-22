@@ -227,10 +227,15 @@ std::string recv_response(int fd) {
     while (true) {
         std::string line;
         char c;
+        bool got_newline = false;
         while (gc(c)) {
-            if (c == '\n') break;
+            if (c == '\n') { got_newline = true; break; }
             line += c;
         }
+        // Connection closed (or recv error) before a complete response:
+        // return "" so the caller reports an error. Without this check the
+        // loop spun forever at 100% CPU when the server died mid-request.
+        if (!got_newline) return "";
         result += line + "\n";
         if (line == "END" || line == "OK" ||
             (line.size() >= 6 && line.substr(0, 6) == "ERROR:"))

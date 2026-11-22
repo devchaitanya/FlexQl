@@ -15,7 +15,8 @@ private:
     QueryResult exec_select(const SelectStmt& s);
     QueryResult exec_group_by(const SelectStmt& s);
     QueryResult exec_delete(const DeleteStmt& s);
-    QueryResult exec_join(const SelectStmt& s);
+    QueryResult exec_join(const SelectStmt& s, bool all_columns = false);
+    QueryResult exec_join_grouped(const SelectStmt& s);   // JOIN + aggregates / GROUP BY
     QueryResult exec_drop(const DropTableStmt& s);
     QueryResult exec_show_tables();
     QueryResult exec_show_databases();

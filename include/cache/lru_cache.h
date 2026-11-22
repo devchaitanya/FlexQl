@@ -3,8 +3,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 // Thread-safe LRU cache with per-table invalidation support.
 // K must be std::string (or any hashable type); V is the cached value.
@@ -14,13 +16,20 @@ public:
     explicit LRUCache(size_t capacity) : capacity_(capacity) {}
 
     // Returns nullptr if not cached.
-    const V* get(const K& key) {
+    //
+    // Returns a shared_ptr, NOT a raw pointer. The old version returned
+    // &entry.value and released the lock; the caller then copied *ptr — but
+    // another thread's put() (eviction) or invalidate_prefix() could free that
+    // entry in between → use-after-free. The shared_ptr copy is taken under
+    // the lock, so the value stays alive for as long as the caller holds it,
+    // even if the cache drops it meanwhile.
+    std::shared_ptr<const V> get(const K& key) {
         std::lock_guard lock(mtx_);
         auto it = map_.find(key);
         if (it == map_.end()) return nullptr;
         // Move to front (most recently used)
         order_.splice(order_.begin(), order_, it->second.list_it);
-        return &it->second.value;
+        return it->second.value;
     }
 
     // Insert/update entry; tag with table name for invalidation.
@@ -29,7 +38,7 @@ public:
         auto it = map_.find(key);
         if (it != map_.end()) {
             // Update in place, move to front
-            it->second.value   = value;
+            it->second.value   = std::make_shared<const V>(value);
             it->second.tag     = table_tag;
             order_.splice(order_.begin(), order_, it->second.list_it);
             return;
@@ -41,7 +50,7 @@ public:
             order_.pop_back();
         }
         order_.push_front(key);
-        map_[key] = {value, table_tag, order_.begin()};
+        map_[key] = {std::make_shared<const V>(value), table_tag, order_.begin()};
     }
 
     // Evict all entries whose tag starts with `prefix` (table name).
@@ -74,7 +83,7 @@ public:
 
 private:
     struct Entry {
-        V                              value;
+        std::shared_ptr<const V>       value;
         std::string                    tag;
         typename std::list<K>::iterator list_it;
     };

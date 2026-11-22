@@ -6,6 +6,9 @@
 #include <unistd.h>
 #include <cstring>
 #include <filesystem>
+#include <algorithm>
+#include <cstdio>
+#include <iostream>
 #include <nmmintrin.h>  // SSE4.2 _mm_crc32_u64/_mm_crc32_u8
 
 // ── CRC-32C (Castagnoli) — hardware SSE4.2 implementation ────────────────────
@@ -55,6 +58,9 @@ bool WalWriter::open(const std::string& path) {
 
     fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ < 0) return false;
+    path_ = path;
+    off_t sz = ::lseek(fd_, 0, SEEK_END);
+    bytes_ = sz > 0 ? (uint64_t)sz : 0;
 
     // Derive next_lsn_ by scanning existing records so we don't reuse LSNs
     // after a restart.
@@ -100,6 +106,7 @@ uint64_t WalWriter::append(std::string_view sql) {
         ssize_t total = ::writev(fd_, iov, 2);
         if (total == static_cast<ssize_t>(20 + sql.size()))
             durable_lsn_ = lsn;
+        if (total > 0) bytes_.fetch_add((uint64_t)total, std::memory_order_relaxed);
     }
 
     return lsn;
@@ -116,9 +123,66 @@ void WalWriter::truncate() {
         ::fdatasync(fd_);
         int _r = ::ftruncate(fd_, 0); (void)_r;
         ::lseek(fd_, 0, SEEK_SET);
-        next_lsn_    = 1;
-        durable_lsn_ = 0;
+        bytes_ = 0;
+        // Do NOT reset next_lsn_: LSNs must stay monotonic across truncation,
+        // otherwise new records (LSN 1, 2, ...) would be <= the snapshot LSN
+        // and silently skipped during recovery.
     }
+}
+
+std::string WalWriter::rotate(uint64_t tag) {
+    std::lock_guard<std::mutex> guard(mtx_);
+    if (fd_ < 0 || path_.empty()) return "";
+    const std::string seg = path_ + "." + std::to_string(tag) + ".old";
+
+    ::close(fd_);
+    fd_ = -1;
+    auto reopen = [&] { fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644); };
+
+    if (std::rename(path_.c_str(), seg.c_str()) != 0) {
+        reopen();                         // rename failed: keep appending to the same file
+    } else {
+        reopen();                         // normal case: a fresh, empty wal.log
+        if (fd_ >= 0) { bytes_ = 0; return seg; }
+        // The new file could not be created (EMFILE, ENOSPC, permissions...).
+        // Undo the rename and keep appending to the old file: nothing rotated.
+        // (Previously the WAL was left CLOSED here and every later write was
+        // silently not logged.)
+        if (std::rename(seg.c_str(), path_.c_str()) == 0) reopen();
+    }
+    if (fd_ < 0) {
+        failed_ = true;
+        std::cerr << "[wal] CRITICAL: WAL could not be reopened after rotate; "
+                     "writes will be rejected\n";
+    }
+    return "";
+}
+
+std::vector<std::string> WalWriter::list_segments(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::vector<std::pair<uint64_t, std::string>> found;
+    try {
+        fs::path p(path);
+        fs::path dir = p.parent_path().empty() ? fs::path(".") : p.parent_path();
+        const std::string prefix = p.filename().string() + ".";   // "wal.log."
+        const std::string suffix = ".old";
+        if (!fs::exists(dir)) return {};
+        for (const auto& e : fs::directory_iterator(dir)) {
+            std::string name = e.path().filename().string();
+            if (name.size() <= prefix.size() + suffix.size()) continue;
+            if (name.compare(0, prefix.size(), prefix) != 0) continue;
+            if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+            std::string num = name.substr(prefix.size(),
+                                          name.size() - prefix.size() - suffix.size());
+            if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos)
+                continue;
+            found.emplace_back(std::stoull(num), e.path().string());
+        }
+    } catch (...) {}
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> out;
+    for (auto& f : found) out.push_back(std::move(f.second));
+    return out;
 }
 
 // ── WalReader ─────────────────────────────────────────────────────────────────

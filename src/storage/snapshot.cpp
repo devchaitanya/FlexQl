@@ -8,6 +8,20 @@
 #include <cstdint>
 #include <regex>
 #include <iostream>
+#include <algorithm>
+#include <cstdio>      // std::rename
+#include <fcntl.h>     // ::open
+#include <unistd.h>    // ::fsync, ::close
+
+// fsync a file or directory by path, so its contents (or, for a directory,
+// its entries — e.g. a rename) survive power loss. Returns false on failure.
+static bool fsync_path(const std::string& p, bool is_dir) {
+    int fd = ::open(p.c_str(), is_dir ? (O_RDONLY | O_DIRECTORY) : O_RDONLY);
+    if (fd < 0) return false;
+    bool ok = (::fsync(fd) == 0);
+    ::close(fd);
+    return ok;
+}
 
 // ── Low-level binary helpers ──────────────────────────────────────────────────
 
@@ -81,7 +95,16 @@ bool Snapshot::write(const std::string& path, uint64_t lsn) {
             std::filesystem::path(path).parent_path());
     } catch (...) {}
 
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    // Crash-safe protocol: write to <path>.tmp, fsync it, atomically rename it
+    // over <path>, then fsync the directory. At every instant either the old
+    // complete snapshot or the new complete snapshot exists — never a torn one.
+    const std::string tmp_path = path + ".tmp";
+    // 1 MB stream buffer → large write() syscalls instead of many small ones.
+    // (Must be installed before open; must outlive the stream.)
+    std::vector<char> iobuf(1 << 20);
+    std::ofstream f;
+    f.rdbuf()->pubsetbuf(iobuf.data(), (std::streamsize)iobuf.size());
+    f.open(tmp_path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
 
     Database& db = Database::instance();
@@ -113,21 +136,24 @@ bool Snapshot::write(const std::string& path, uint64_t lsn) {
             if (!write_u8(f, flags))     return false;
         }
 
-        lock.unlock(); // release before calling higher-level method
+        lock.unlock(); // write_rows() takes its own shared lock
 
-        auto snap_rows = tbl->snapshot_rows();
-        if (!write_u64(f, (uint64_t)snap_rows.size())) return false;
-
-        for (const auto& [vals, expires] : snap_rows) {
-            if (!write_u64(f, (uint64_t)(int64_t)expires)) return false;
-            for (const auto& v : vals) {
-                if (!write_str(f, v)) return false;
-            }
-        }
+        // Stream rows directly from table memory (no full-table copy). Same
+        // on-disk format as before: [count:8] then [expires:8][len:4][bytes]...
+        if (!tbl->write_rows(f)) return false;
     }
 
     f.flush();
-    return !!f;
+    if (!f) return false;
+    f.close();                                   // hand all bytes to the kernel
+    if (f.fail()) return false;
+
+    if (!fsync_path(tmp_path, /*is_dir=*/false)) return false;   // bytes on disk
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) return false; // atomic swap
+
+    std::string dir = std::filesystem::path(path).parent_path().string();
+    if (dir.empty()) dir = ".";
+    return fsync_path(dir, /*is_dir=*/true);     // make the rename itself durable
 }
 
 // ── Snapshot::load ────────────────────────────────────────────────────────────
@@ -198,22 +224,40 @@ uint64_t Snapshot::load(const std::string& path) {
 }
 
 // ── Snapshot::find_latest ─────────────────────────────────────────────────────
-SnapshotInfo Snapshot::find_latest(const std::string& dir) {
-    SnapshotInfo best;
+std::vector<SnapshotInfo> Snapshot::list_all(const std::string& dir) {
+    std::vector<SnapshotInfo> out;
     try {
-        if (!std::filesystem::exists(dir)) return best;
-        std::regex re("snap_(\\d+)\\.bin");
+        if (!std::filesystem::exists(dir)) return out;
+        std::regex re("snap_(\\d+)\\.bin");      // ".bin.tmp" files don't match
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
             std::string fname = entry.path().filename().string();
             std::smatch m;
-            if (std::regex_match(fname, m, re)) {
-                uint64_t lsn = std::stoull(m[1].str());
-                if (lsn >= best.lsn) {
-                    best.lsn  = lsn;
-                    best.path = entry.path().string();
-                }
-            }
+            if (std::regex_match(fname, m, re))
+                out.push_back({std::stoull(m[1].str()), entry.path().string()});
         }
     } catch (...) {}
-    return best;
+    std::sort(out.begin(), out.end(),
+              [](const SnapshotInfo& a, const SnapshotInfo& b) { return a.lsn > b.lsn; });
+    return out;
+}
+
+SnapshotInfo Snapshot::find_latest(const std::string& dir) {
+    auto all = list_all(dir);
+    return all.empty() ? SnapshotInfo{} : all.front();
+}
+
+void Snapshot::prune(const std::string& dir, size_t keep) {
+    std::error_code ec;
+    auto all = list_all(dir);
+    for (size_t i = keep; i < all.size(); ++i)
+        std::filesystem::remove(all[i].path, ec);
+
+    // Leftovers from writes interrupted by a crash
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            const std::string fname = entry.path().filename().string();
+            if (fname.size() > 4 && fname.compare(fname.size() - 4, 4, ".tmp") == 0)
+                std::filesystem::remove(entry.path(), ec);
+        }
+    } catch (...) {}
 }

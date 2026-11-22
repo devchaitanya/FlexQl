@@ -17,7 +17,14 @@ void ThreadPool::submit(std::function<void()> task) {
 }
 
 void ThreadPool::shutdown() {
-    stop_ = true;
+    {
+        // Set the flag UNDER the mutex. A worker checks the predicate and goes
+        // to sleep atomically w.r.t. this mutex; if stop_ were set without it,
+        // the notify below could fire between the worker's check (false) and
+        // its sleep → the wakeup is lost and join() hangs forever.
+        std::lock_guard lock(mtx_);
+        stop_ = true;
+    }
     cv_.notify_all();
     for (auto& t : workers_)
         if (t.joinable()) t.join();

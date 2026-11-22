@@ -97,14 +97,14 @@ $(BUILD)/test/test_flexql.o: tests/test_flexql.cpp | $(BUILD)
 # ── Sanitizer builds ─────────────────────────────────────────────────────────
 # AddressSanitizer: detects heap/stack buffer overflows, use-after-free, memory leaks
 test-asan:
-	$(CXX) -std=c++17 -g -O1 -fsanitize=address -fno-omit-frame-pointer \
+	$(CXX) -std=c++17 -march=native -g -O1 -fsanitize=address -fno-omit-frame-pointer \
 	    -Wall -Wextra -pthread -Iinclude -Isrc/client \
 	    $(TEST_SRCS) -o $(BIN)/flexql-test-asan
 	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 $(BIN)/flexql-test-asan
 
 # ThreadSanitizer: detects data races between threads
 test-tsan:
-	$(CXX) -std=c++17 -g -O1 -fsanitize=thread \
+	$(CXX) -std=c++17 -march=native -g -O1 -fsanitize=thread \
 	    -Wall -Wextra -pthread -Iinclude -Isrc/client \
 	    $(TEST_SRCS) -o $(BIN)/flexql-test-tsan
 	TSAN_OPTIONS=abort_on_error=1 $(BIN)/flexql-test-tsan

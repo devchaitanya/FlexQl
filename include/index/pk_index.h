@@ -20,10 +20,12 @@ class PrimaryIndex {
     };
 
     std::vector<Slot> slots_;
-    size_t            count_    = 0;   // occupied, non-tombstone entries
-    size_t            capacity_ = 0;   // slots_.size() (always power of 2)
+    size_t            count_      = 0; // occupied, non-tombstone entries
+    size_t            tombstones_ = 0; // occupied, tombstone entries
+    size_t            capacity_   = 0; // slots_.size() (always power of 2)
 
-    static constexpr double MAX_LOAD = 0.6;
+    static constexpr double MAX_LOAD    = 0.6;
+    static constexpr double GROW_TARGET = 0.5;   // live-key load right after grow()
 
     static uint64_t fnv64(std::string_view s) noexcept {
         uint64_t h = 14695981039346656037ULL;
@@ -32,8 +34,13 @@ class PrimaryIndex {
         return h;
     }
 
+    // Rebuild into a table sized so the live keys fill at most 50% (when live
+    // keys drove the growth — 60% full — that is exactly a doubling; when it
+    // was mostly tombstones, the same size or smaller). Uses the stored
+    // hashes — no rehashing of key bytes — and drops every tombstone.
     void grow() {
-        size_t new_cap = (capacity_ == 0) ? 16 : capacity_ * 2;
+        size_t new_cap = 16;
+        while ((double)(count_ + 1) / (double)new_cap > GROW_TARGET) new_cap <<= 1;
         std::vector<Slot> new_slots(new_cap);
         size_t mask = new_cap - 1;
         for (const auto& s : slots_) {
@@ -42,14 +49,19 @@ class PrimaryIndex {
             while (new_slots[pos].occupied) pos = (pos + 1) & mask;
             new_slots[pos] = s;
         }
-        slots_    = std::move(new_slots);
-        capacity_ = new_cap;
+        slots_      = std::move(new_slots);
+        capacity_   = new_cap;
+        tombstones_ = 0;
     }
 
 public:
     // Returns true if key was inserted (false = duplicate).
     bool insert(std::string_view key, size_t row_idx) {
-        if (capacity_ == 0 || (double)(count_ + 1) / (double)capacity_ > MAX_LOAD)
+        // Tombstones occupy slots too: the probe loop below stops only at an
+        // EMPTY slot, so count them, or a table full of tombstones would make
+        // insert() loop forever.
+        if (capacity_ == 0 ||
+            (double)(count_ + tombstones_ + 1) / (double)capacity_ > MAX_LOAD)
             grow();
 
         uint64_t h    = fnv64(key);
@@ -68,7 +80,8 @@ public:
             }
             pos = (pos + 1) & mask;
         }
-        size_t insert_pos = (first_tombstone != SIZE_MAX) ? first_tombstone : pos;
+        size_t insert_pos = pos;
+        if (first_tombstone != SIZE_MAX) { insert_pos = first_tombstone; --tombstones_; }
         slots_[insert_pos] = {h, key, row_idx, true, false};
         ++count_;
         return true;
@@ -99,13 +112,40 @@ public:
             if (!slots_[pos].tombstone && slots_[pos].hash == h && slots_[pos].key == key) {
                 slots_[pos].tombstone = true;
                 --count_;
+                ++tombstones_;
                 return;
             }
             pos = (pos + 1) & mask;
         }
     }
 
-    void   clear()  { slots_.clear(); count_ = 0; capacity_ = 0; }
+    void   clear()  { slots_.clear(); count_ = 0; tombstones_ = 0; capacity_ = 0; }
+
+    // Drop all entries and pre-size for n keys in one allocation, so a bulk
+    // re-insert (compaction) does not go through ~log2(n) grow()+rehash steps.
+    void reset(size_t n) {
+        size_t cap = 16;
+        while ((double)(n + 1) / (double)cap > MAX_LOAD) cap <<= 1;
+        slots_.assign(cap, Slot{});
+        capacity_   = cap;
+        count_      = 0;
+        tombstones_ = 0;
+    }
+
+    // After compaction moved rows: old row r now lives at remap[r], or was
+    // dropped (DROPPED → its key is tombstoned; e.g. an expired row).
+    // Keys still point at the same arena bytes (tier 1 never moves strings),
+    // so only row numbers change: ONE sequential pass over the slots — no key
+    // hashing, no probing, no random inserts.
+    static constexpr uint32_t DROPPED = UINT32_MAX;
+    void remap_rows(const std::vector<uint32_t>& remap) {
+        for (Slot& s : slots_) {
+            if (!s.occupied || s.tombstone) continue;
+            const uint32_t n = s.row_idx < remap.size() ? remap[s.row_idx] : DROPPED;
+            if (n == DROPPED) { s.tombstone = true; --count_; ++tombstones_; }
+            else              s.row_idx = n;
+        }
+    }
 
     // Update row_idx after compaction (key stays in arena, same pointer).
     void update(std::string_view key, size_t new_idx) {
@@ -123,5 +163,20 @@ public:
         }
     }
 
-    size_t size()   const { return count_; }
+    // Rebuild when tombstones outnumber live keys. Inserts trigger grow() only
+    // when the table gets too full, so a delete-heavy table with few inserts
+    // would otherwise keep its tombstones (longer probe chains) and its large
+    // slot array forever. grow() drops every tombstone and sizes the new array
+    // for the LIVE keys — so this also shrinks the index. Called by the
+    // background sweep (tier 1). Returns true if it rebuilt.
+    bool compact_if_sparse(size_t min_tombstones = 1024) {
+        if (tombstones_ < min_tombstones || tombstones_ <= count_) return false;
+        grow();
+        return true;
+    }
+
+    size_t size()       const { return count_; }
+    size_t tombstones() const { return tombstones_; }
+    size_t capacity()   const { return capacity_; }
+    size_t bytes()      const { return capacity_ * sizeof(Slot); }
 };

@@ -73,10 +73,30 @@ std::vector<Token> tokenize(const std::string& sql) {
         // Skip whitespace
         if (std::isspace((unsigned char)sql[i])) { ++i; continue; }
 
-        // String literal 'text'  — zero-copy fast path (no escape handling)
+        // String literal 'text'. Common case: no escapes → zero-copy view into
+        // the SQL. SQL escapes a quote by doubling it ('O''Brien' = O'Brien);
+        // then the value is not a contiguous slice, so the unescaped text goes
+        // into token.value (and sv stays empty).
         if (sql[i] == '\'') {
             size_t start = ++i; // skip opening quote
             size_t end   = sql.find('\'', start);
+            if (end != std::string::npos && end + 1 < n && sql[end + 1] == '\'') {
+                std::string text;
+                size_t j = start;
+                while (true) {
+                    size_t q = sql.find('\'', j);
+                    if (q == std::string::npos) { end = std::string::npos; break; }
+                    text.append(sql, j, q - j);
+                    if (q + 1 < n && sql[q + 1] == '\'') { text += '\''; j = q + 2; continue; }
+                    end = q;
+                    break;
+                }
+                if (end != std::string::npos) {
+                    tokens.push_back({TokenType::STRING_LIT, std::move(text), {}});
+                    i = end + 1;
+                    continue;
+                }
+            }
             if (end != std::string::npos) {
                 tokens.push_back({TokenType::STRING_LIT, {}, {sql.data() + start, end - start}});
                 i = end + 1;

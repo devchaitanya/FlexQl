@@ -3,15 +3,38 @@
 #include "utils/string_utils.h"
 #include <algorithm>
 #include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <ctime>
 #include <immintrin.h>   // AVX2 / SSE intrinsics
+#include <ostream>
 
 // ── Construction ──────────────────────────────────────────────────────────────
 Table::Table(TableSchema schema)
     : schema_(std::move(schema)),
       num_cols_((int)schema_.columns.size()),
-      int_cols_((size_t)num_cols_) {}
+      int_cols_((size_t)num_cols_),
+      int_exact_((size_t)num_cols_, 1) {}
+
+// True if every literal of a predicate leaf is an exact integer, so the int64
+// fast path compares exactly what the slow (stod) path would.
+static bool pred_literals_exact(const Predicate& p) {
+    auto exact = [](const std::string& s) {
+        if (s.empty()) return false;
+        size_t start = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+        if (start >= s.size() || s.size() - start > 18) return false;
+        for (size_t i = start; i < s.size(); ++i)
+            if (s[i] < '0' || s[i] > '9') return false;
+        return true;
+    };
+    if (p.op == "BETWEEN" || p.op == "NOT BETWEEN")
+        return exact(p.val) && exact(p.val2);
+    if (p.op == "IN" || p.op == "NOT IN") {
+        for (const auto& v : p.in_vals) if (!exact(v)) return false;
+        return true;
+    }
+    return exact(p.val);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 bool Table::is_expired(const RowMeta& m) const {
@@ -50,6 +73,45 @@ std::string Table::validate_type(std::string_view val, ColumnType type,
         case ColumnType::DATETIME:
             // Accept numeric timestamps and common date formats
             return "";
+    }
+    return "";
+}
+
+std::string Table::validate_value(int col, std::string_view v) const {
+    const ColumnDef& cd = schema_.columns[col];
+    if (v.empty()) {
+        if (cd.not_null || col == schema_.pk_col_index)
+            return "NULL value not allowed in NOT NULL column " + cd.name;
+        return "";
+    }
+    return validate_type(v, cd.type, cd.name);
+}
+
+// Hot path for batch INSERT: a yes/no check per value with no std::string
+// construction; the error message is built only when a value is invalid.
+static inline bool numeric_ok(std::string_view v, bool allow_dot) {
+    size_t i = (v[0] == '-' || v[0] == '+') ? 1 : 0;
+    if (i >= v.size()) return false;
+    bool dot = false;
+    for (; i < v.size(); ++i) {
+        const char ch = v[i];
+        if (ch >= '0' && ch <= '9') continue;
+        if (allow_dot && ch == '.' && !dot) { dot = true; continue; }
+        return false;
+    }
+    return true;
+}
+
+std::string Table::validate_row(const std::string_view* row) const {
+    for (int c = 0; c < num_cols_; ++c) {
+        const std::string_view v = row[c];
+        const ColumnDef& cd = schema_.columns[c];
+        bool ok;
+        if (v.empty())                         ok = !(cd.not_null || c == schema_.pk_col_index);
+        else if (cd.type == ColumnType::INT)     ok = numeric_ok(v, false);
+        else if (cd.type == ColumnType::DECIMAL) ok = numeric_ok(v, true);
+        else                                     ok = true;
+        if (__builtin_expect(!ok, 0)) return validate_value(c, v);   // builds the message
     }
     return "";
 }
@@ -105,81 +167,101 @@ bool Table::compare_values(std::string_view row_val,
 }
 
 
-bool Table::matches_pred(size_t row_idx, const Predicate& pred) const {
-    switch (pred.kind) {
+Table::BoundPred Table::bind(const Predicate& pred) const {
+    BoundPred b;
+    b.kind = (int)pred.kind;
+    b.src  = &pred;
+    if (pred.kind != Predicate::LEAF) {
+        b.children.reserve(pred.children.size());
+        for (const auto& c : pred.children) b.children.push_back(bind(*c));
+        return b;
+    }
+    // Column: strip an optional "table." prefix, resolve the index once.
+    std::string_view col_name = pred.col;
+    const size_t dot = col_name.find('.');
+    if (dot != std::string_view::npos) col_name = col_name.substr(dot + 1);
+    b.col = schema_.col_index(std::string(col_name));
+    if (b.col < 0 || b.col >= num_cols_) { b.col = -1; return b; }
+    b.ct = schema_.columns[b.col].type;
+
+    const std::string& o = pred.op;
+    b.op = o == "="  ? BoundPred::EQ : o == "!=" ? BoundPred::NE :
+           o == ">"  ? BoundPred::GT : o == ">=" ? BoundPred::GE :
+           o == "<"  ? BoundPred::LT : o == "<=" ? BoundPred::LE :
+           o == "LIKE" ? BoundPred::LIKE :
+           o == "IS NULL" ? BoundPred::IS_NULL : o == "IS NOT NULL" ? BoundPred::NOT_NULL :
+           o == "BETWEEN" ? BoundPred::BETWEEN : o == "NOT BETWEEN" ? BoundPred::NOT_BETWEEN :
+           o == "IN" ? BoundPred::IN : o == "NOT IN" ? BoundPred::NOT_IN : BoundPred::OTHER;
+
+    // int64 fast path only if the column holds exact ints AND every literal is
+    // an exact int (checked ONCE here — previously re-checked for every row).
+    b.use_int = int_fast(b.col) && b.op != BoundPred::LIKE && b.op != BoundPred::OTHER &&
+                b.op != BoundPred::IS_NULL && b.op != BoundPred::NOT_NULL &&
+                pred_literals_exact(pred);
+    if (b.use_int) {
+        b.iv  = parse_int64(pred.val);
+        b.iv2 = parse_int64(pred.val2);
+        for (const auto& v : pred.in_vals) b.ivals.push_back(parse_int64(v));
+    }
+    return b;
+}
+
+bool Table::eval(size_t row_idx, const BoundPred& b) const {
+    switch (b.kind) {
         case Predicate::AND_NODE:
-            for (const auto& c : pred.children)
-                if (!matches_pred(row_idx, *c)) return false;
+            for (const auto& c : b.children) if (!eval(row_idx, c)) return false;
             return true;
-
         case Predicate::OR_NODE:
-            for (const auto& c : pred.children)
-                if (matches_pred(row_idx, *c)) return true;
+            for (const auto& c : b.children) if (eval(row_idx, c)) return true;
             return false;
-
         case Predicate::NOT_NODE:
-            return !pred.children.empty() && !matches_pred(row_idx, *pred.children[0]);
+            return !b.children.empty() && !eval(row_idx, b.children[0]);
+        default: break;   // LEAF
+    }
+    if (b.col < 0) return false;
+    const std::string_view row_val = val_at(row_idx, b.col);
+    if (b.op == BoundPred::IS_NULL)  return row_val.empty();
+    if (b.op == BoundPred::NOT_NULL) return !row_val.empty();
 
-        case Predicate::LEAF: {
-            std::string col_name = pred.col;
-            size_t dot = col_name.find('.');
-            if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
-            int idx = schema_.col_index(col_name);
-            if (idx < 0 || idx >= num_cols_) return false;
-            std::string_view row_val = val_at(row_idx, idx);
-
-            if (pred.op == "IS NULL")     return row_val.empty();
-            if (pred.op == "IS NOT NULL") return !row_val.empty();
-
-            // Fast path: use native int64 for numeric columns (no stod overhead)
-            if (is_numeric_col(idx) && idx < (int)int_cols_.size() &&
-                !int_cols_[idx].empty()) {
-                int64_t rv = int_cols_[idx][row_idx];
-
-                if (pred.op == "BETWEEN" || pred.op == "NOT BETWEEN") {
-                    int64_t lo = parse_int64(pred.val);
-                    int64_t hi = parse_int64(pred.val2);
-                    bool in_range = rv >= lo && rv <= hi;
-                    return pred.op == "BETWEEN" ? in_range : !in_range;
-                }
-                if (pred.op == "IN" || pred.op == "NOT IN") {
-                    bool found = false;
-                    for (const auto& v : pred.in_vals)
-                        if (rv == parse_int64(v)) { found = true; break; }
-                    return pred.op == "IN" ? found : !found;
-                }
-                if (pred.op == "LIKE") return like_match(row_val, pred.val);
-
-                int64_t tv = parse_int64(pred.val);
-                if (pred.op == "=")  return rv == tv;
-                if (pred.op == "!=") return rv != tv;
-                if (pred.op == ">")  return rv > tv;
-                if (pred.op == ">=") return rv >= tv;
-                if (pred.op == "<")  return rv < tv;
-                if (pred.op == "<=") return rv <= tv;
-                return false;
-            }
-
-            // String / non-numeric fallback
-            ColumnType ct = schema_.columns[idx].type;
-
-            if (pred.op == "BETWEEN" || pred.op == "NOT BETWEEN") {
-                bool in_range = !compare_values(row_val, "<", pred.val, ct) &&
-                                !compare_values(row_val, ">", pred.val2, ct);
-                return pred.op == "BETWEEN" ? in_range : !in_range;
-            }
-
-            if (pred.op == "IN" || pred.op == "NOT IN") {
+    if (b.use_int) {
+        const int64_t rv = int_cols_[b.col][row_idx];
+        switch (b.op) {
+            case BoundPred::EQ: return rv == b.iv;
+            case BoundPred::NE: return rv != b.iv;
+            case BoundPred::GT: return rv >  b.iv;
+            case BoundPred::GE: return rv >= b.iv;
+            case BoundPred::LT: return rv <  b.iv;
+            case BoundPred::LE: return rv <= b.iv;
+            case BoundPred::BETWEEN:     return rv >= b.iv && rv <= b.iv2;
+            case BoundPred::NOT_BETWEEN: return !(rv >= b.iv && rv <= b.iv2);
+            case BoundPred::IN:
+            case BoundPred::NOT_IN: {
                 bool found = false;
-                for (const auto& v : pred.in_vals)
-                    if (compare_values(row_val, "=", v, ct)) { found = true; break; }
-                return pred.op == "IN" ? found : !found;
+                for (int64_t v : b.ivals) if (rv == v) { found = true; break; }
+                return b.op == BoundPred::IN ? found : !found;
             }
-
-            return compare_values(row_val, pred.op, pred.val, ct);
+            default: return false;
         }
     }
-    return false;
+
+    // String / non-exact numeric fallback (same semantics as before).
+    const Predicate& p = *b.src;
+    if (b.op == BoundPred::BETWEEN || b.op == BoundPred::NOT_BETWEEN) {
+        const bool in_range = !compare_values(row_val, "<", p.val, b.ct) &&
+                              !compare_values(row_val, ">", p.val2, b.ct);
+        return b.op == BoundPred::BETWEEN ? in_range : !in_range;
+    }
+    if (b.op == BoundPred::IN || b.op == BoundPred::NOT_IN) {
+        bool found = false;
+        for (const auto& v : p.in_vals)
+            if (compare_values(row_val, "=", v, b.ct)) { found = true; break; }
+        return b.op == BoundPred::IN ? found : !found;
+    }
+    return compare_values(row_val, p.op, p.val, b.ct);
+}
+
+bool Table::matches_pred(size_t row_idx, const Predicate& pred) const {
+    return eval(row_idx, bind(pred));
 }
 
 std::vector<std::string> Table::project(size_t row_idx,
@@ -203,9 +285,9 @@ std::string Table::insert(std::vector<std::string> values, int64_t expires_at) {
         return "column count mismatch: expected " + std::to_string(num_cols_) +
                " got " + std::to_string(values.size());
 
-    // Validate column types
+    // Enforce schema (NOT NULL + types)
     for (int c = 0; c < num_cols_; ++c) {
-        auto err = validate_type(values[c], schema_.columns[c].type, schema_.columns[c].name);
+        auto err = validate_value(c, values[c]);
         if (!err.empty()) return err;
     }
 
@@ -218,11 +300,12 @@ std::string Table::insert(std::vector<std::string> values, int64_t expires_at) {
     for (const auto& v : values)
         rows_vals_.push_back(arena_.intern(v));
     rows_meta_.push_back({expires_at, false});
+    note_expiry(expires_at, 1);
 
     // Populate native int64 columns
     for (int c = 0; c < num_cols_; ++c)
         if (is_numeric_col(c))
-            int_cols_[c].push_back(parse_int64(values[c]));
+            push_int(c, values[c]);
 
     if (schema_.pk_col_index >= 0)
         pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
@@ -237,12 +320,11 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
         return "column count mismatch: expected " + std::to_string(num_cols_) +
                " got " + std::to_string(ncols);
 
-    // Validate column types (check first row only for batch performance)
-    if (n_rows > 0) {
-        for (int c = 0; c < num_cols_; ++c) {
-            auto err = validate_type(flat[c], schema_.columns[c].type, schema_.columns[c].name);
-            if (!err.empty()) return err;
-        }
+    // Enforce schema on EVERY row before storing anything (outside the lock —
+    // the schema is immutable), so a bad row rejects the whole batch.
+    for (size_t r = 0; r < n_rows; ++r) {
+        auto err = validate_row(flat + r * (size_t)num_cols_);
+        if (!err.empty()) return "row " + std::to_string(r + 1) + ": " + err;
     }
 
     std::unique_lock lock(mtx);
@@ -273,6 +355,7 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
         const size_t base_row = rows_meta_.size();
         const size_t base_val = rows_vals_.size();
         rows_meta_.resize(base_row + n_rows, {expires_at, false});
+        note_expiry(expires_at, n_rows);
         rows_vals_.resize(base_val + n_rows * (size_t)num_cols_);
         size_t vi = base_val;
         for (size_t r = 0; r < n_rows; ++r) {
@@ -285,7 +368,7 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
             if (!is_numeric_col(c)) continue;
             int_cols_[c].resize(base_row + n_rows);
             for (size_t r = 0; r < n_rows; ++r)
-                int_cols_[c][base_row + r] = parse_int64(flat[r * (size_t)num_cols_ + c]);
+                store_int(c, base_row + r, flat[r * (size_t)num_cols_ + c]);
         }
         return "";
     }
@@ -299,10 +382,11 @@ std::string Table::insert_flat(const std::string_view* flat, size_t n_rows,
         for (int c = 0; c < num_cols_; ++c)
             rows_vals_.push_back(arena_.intern(row[c]));
         rows_meta_.push_back({expires_at, false});
+        note_expiry(expires_at, 1);
         // Populate native int64 columns
         for (int c = 0; c < num_cols_; ++c)
             if (is_numeric_col(c))
-                int_cols_[c].push_back(parse_int64(row[c]));
+                push_int(c, row[c]);
         pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
     }
     return "";
@@ -343,13 +427,9 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
                 return "duplicate primary key: " +
                        std::string(batch[r][schema_.pk_col_index]);
         }
-        // Validate column types (first row only for batch performance)
-        if (r == 0) {
-            for (int c = 0; c < num_cols_; ++c) {
-                auto err = validate_type(batch[r][c], schema_.columns[c].type, schema_.columns[c].name);
-                if (!err.empty()) return err;
-            }
-        }
+        // Enforce schema (NOT NULL + types) on every row
+        auto err = validate_row(batch[r].data());
+        if (!err.empty()) return "row " + std::to_string(r + 1) + ": " + err;
     }
 
     // Intern + store
@@ -358,10 +438,11 @@ std::string Table::insert_batch(std::vector<std::vector<std::string_view>> batch
         for (auto sv : batch[r])
             rows_vals_.push_back(arena_.intern(sv));
         rows_meta_.push_back({expires_vec[r], false});
+        note_expiry(expires_vec[r], 1);
         // Populate native int64 columns
         for (int c = 0; c < num_cols_; ++c)
             if (is_numeric_col(c))
-                int_cols_[c].push_back(parse_int64(batch[r][c]));
+                push_int(c, batch[r][c]);
         if (schema_.pk_col_index >= 0)
             pk_index_.insert(val_at(row_idx, schema_.pk_col_index), row_idx);
     }
@@ -383,7 +464,7 @@ int Table::delete_rows(const Predicate* where) {
             if (pos >= 0) {
                 auto& m = rows_meta_[(size_t)pos];
                 if (!m.deleted && !is_expired(m)) {
-                    m.deleted = true;
+                    tombstone((size_t)pos);
                     pk_index_.remove(where->val);
                     return 1;
                 }
@@ -405,7 +486,7 @@ int Table::delete_rows(const Predicate* where) {
                 if (pos >= 0) {
                     auto& m = rows_meta_[(size_t)pos];
                     if (!m.deleted && !is_expired(m)) {
-                        m.deleted = true;
+                        tombstone((size_t)pos);
                         pk_index_.remove(v);
                         ++count;
                     }
@@ -415,13 +496,15 @@ int Table::delete_rows(const Predicate* where) {
         }
     }
 
-    // General scan
+    // General scan (WHERE bound once, not per row)
     int count = 0;
+    BoundPred bw;
+    if (where) bw = bind(*where);
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         auto& m = rows_meta_[i];
         if (m.deleted || is_expired(m)) continue;
-        if (!where || matches_pred(i, *where)) {
-            m.deleted = true;
+        if (!where || eval(i, bw)) {
+            tombstone(i);
             if (schema_.pk_col_index >= 0)
                 pk_index_.remove(val_at(i, schema_.pk_col_index));
             ++count;
@@ -572,8 +655,7 @@ size_t Table::count_rows(const Predicate* where) const {
         size_t dot = col_name.find('.');
         if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
         int pred_col = schema_.col_index(col_name);
-        if (pred_col >= 0 && is_numeric_col(pred_col) &&
-            pred_col < (int)int_cols_.size() && !int_cols_[pred_col].empty()) {
+        if (int_fast(pred_col) && pred_literals_exact(*where)) {
             std::vector<size_t> matched;
             matched.reserve(rows_meta_.size());
             const int64_t* col_data = int_cols_[pred_col].data();
@@ -599,63 +681,147 @@ size_t Table::count_rows(const Predicate* where) const {
         }
     }
 
-    // General fallback
+    // General fallback (WHERE bound once, not per row)
     size_t count = 0;
+    BoundPred bw;
+    if (where) bw = bind(*where);
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-        if (where && !matches_pred(i, *where)) continue;
+        if (where && !eval(i, bw)) continue;
         ++count;
     }
     return count;
 }
 
 // ── O(1)-memory aggregate (SUM/MIN/MAX) ───────────────────────────────────────
-Table::AggResult Table::compute_aggregate(int col_idx, const Predicate* where) const {
+int64_t Table::aggregate(const Predicate* where, const std::vector<int>& cols,
+                         std::vector<AggState>& out) const {
     std::shared_lock lock(mtx);
-    AggResult r;
-    bool use_int = is_numeric_col(col_idx) &&
-                   col_idx < (int)int_cols_.size() &&
-                   !int_cols_[col_idx].empty();
 
-    for (size_t i = 0; i < rows_meta_.size(); ++i) {
-        if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-        if (where && !matches_pred(i, *where)) continue;
-
-        if (use_int) {
-            int64_t v = int_cols_[col_idx][i];
-            double  d = static_cast<double>(v);
-            r.sum += d;
-            if (r.count == 0 || d < r.min_val) {
-                r.min_val = d;
-                r.min_str = std::to_string(v);
-            }
-            if (r.count == 0 || d > r.max_val) {
-                r.max_val = d;
-                r.max_str = std::to_string(v);
-            }
-        } else {
-            std::string_view sv = val_at(i, col_idx);
-            try {
-                double d = std::stod(std::string(sv));
-                r.sum += d;
-                if (r.count == 0 || d < r.min_val) {
-                    r.min_val = d;
-                    r.min_str = std::string(sv);
-                }
-                if (r.count == 0 || d > r.max_val) {
-                    r.max_val = d;
-                    r.max_str = std::string(sv);
-                }
-            } catch (...) {
-                if (r.min_str.empty() || std::string(sv) < r.min_str)
-                    r.min_str = std::string(sv);
-                if (r.max_str.empty() || std::string(sv) > r.max_str)
-                    r.max_str = std::string(sv);
-            }
-        }
-        ++r.count;
+    // One AggState per requested column; numeric-ness comes from the schema.
+    out.clear();
+    std::vector<char> use_int(cols.size());
+    for (size_t k = 0; k < cols.size(); ++k) {
+        out.emplace_back(is_numeric_col(cols[k]));
+        use_int[k] = int_fast(cols[k]);     // exact int64 copy available → no parsing
     }
-    return r;
+    BoundPred bw;
+    if (where) bw = bind(*where);
+    const int64_t now = (int64_t)std::time(nullptr);
+
+    // Vectorized (chunked) execution:
+    //   1. for a chunk of 1024 rows, collect the matching row numbers into a
+    //      small "selection vector" (liveness + WHERE evaluated ONCE per row);
+    //   2. then, per column, run a tight loop over just those rows with a LOCAL
+    //      accumulator. A local the compiler can see is not aliased by the
+    //      column pointer, so isum/imin/imax/count stay in CPU registers.
+    //      (Updating out[k] directly per row forced a store to memory per row:
+    //      ~40% slower.) Memory stays O(1): one 1024-entry buffer.
+    constexpr size_t CHUNK = 1024;
+    size_t  sel[CHUNK];
+    int64_t rows = 0;
+    const size_t n = rows_meta_.size();
+    for (size_t base = 0; base < n; base += CHUNK) {
+        const size_t end = std::min(n, base + CHUNK);
+        size_t m = 0;
+        for (size_t i = base; i < end; ++i) {
+            const RowMeta& meta = rows_meta_[i];
+            if (meta.deleted || (meta.expires_at != 0 && meta.expires_at <= now)) continue;
+            if (where && !eval(i, bw)) continue;
+            sel[m++] = i;
+        }
+        rows += (int64_t)m;
+        for (size_t k = 0; k < cols.size(); ++k) {
+            AggState acc = std::move(out[k]);          // local copy → registers
+            const int c = cols[k];
+            if (use_int[k]) {                          // int_fast ⇒ no NULLs in column
+                const int64_t* col = int_cols_[c].data();
+                for (size_t j = 0; j < m; ++j) acc.add_int(col[sel[j]]);
+            } else {
+                for (size_t j = 0; j < m; ++j) acc.add_text(val_at(sel[j], c));
+            }
+            out[k] = std::move(acc);
+        }
+    }
+    return rows;
+}
+
+Table::GroupResult Table::group_aggregate(const Predicate* where,
+                                          const std::vector<int>& group_cols,
+                                          const std::vector<int>& agg_cols) const {
+    std::shared_lock lock(mtx);
+
+    std::vector<char> numeric(agg_cols.size()), use_int(agg_cols.size());
+    for (size_t k = 0; k < agg_cols.size(); ++k) {
+        numeric[k] = is_numeric_col(agg_cols[k]);
+        use_int[k] = int_fast(agg_cols[k]);
+    }
+    BoundPred bw;
+    if (where) bw = bind(*where);
+    const int64_t now = (int64_t)std::time(nullptr);
+
+    GroupResult gr;
+    std::vector<size_t> first_row;                 // per group: where its key text comes from
+
+    auto new_group = [&](size_t row) -> uint32_t {
+        first_row.push_back(row);
+        gr.rows.push_back(0);
+        gr.states.emplace_back();
+        for (size_t k = 0; k < agg_cols.size(); ++k) gr.states.back().emplace_back(numeric[k] != 0);
+        return (uint32_t)(gr.rows.size() - 1);
+    };
+    auto add_row = [&](uint32_t g, size_t i) {
+        ++gr.rows[g];
+        std::vector<AggState>& st = gr.states[g];
+        for (size_t k = 0; k < agg_cols.size(); ++k) {
+            const int c = agg_cols[k];
+            if (use_int[k]) st[k].add_int(int_cols_[c][i]);
+            else            st[k].add_text(val_at(i, c));
+        }
+    };
+    auto alive_match = [&](size_t i) {
+        const RowMeta& m = rows_meta_[i];
+        if (m.deleted || (m.expires_at != 0 && m.expires_at <= now)) return false;
+        return !where || eval(i, bw);
+    };
+
+    if (group_cols.size() == 1 && int_fast(group_cols[0])) {
+        // Fast path: ONE group column holding exact integers → the hash key is
+        // the int64 itself. No string is built per row at all.
+        const int64_t* gcol = int_cols_[group_cols[0]].data();
+        std::unordered_map<int64_t, uint32_t> map;
+        for (size_t i = 0; i < rows_meta_.size(); ++i) {
+            if (!alive_match(i)) continue;
+            auto [it, inserted] = map.try_emplace(gcol[i], 0);
+            if (inserted) it->second = new_group(i);
+            add_row(it->second, i);
+        }
+    } else {
+        // General path: key = for each group column [4-byte length][bytes].
+        // Length-prefixing makes keys unambiguous: ("ab","c") ≠ ("a","bc"),
+        // whatever bytes the values contain. One reused buffer → no
+        // allocation per row except when a NEW group is inserted.
+        std::unordered_map<std::string, uint32_t> map;
+        std::string key;
+        for (size_t i = 0; i < rows_meta_.size(); ++i) {
+            if (!alive_match(i)) continue;
+            key.clear();
+            for (int g : group_cols) {
+                const std::string_view v = val_at(i, g);
+                const uint32_t len = (uint32_t)v.size();
+                key.append(reinterpret_cast<const char*>(&len), sizeof len);
+                key.append(v.data(), v.size());
+            }
+            auto it = map.find(key);
+            if (it == map.end()) it = map.emplace(key, new_group(i)).first;
+            add_row(it->second, i);
+        }
+    }
+
+    gr.keys.resize(first_row.size());
+    for (size_t g = 0; g < first_row.size(); ++g)
+        for (int c : group_cols) gr.keys[g].emplace_back(val_at(first_row[g], c));
+    return gr;
 }
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
@@ -756,8 +922,7 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
         size_t dot = col_name.find('.');
         if (dot != std::string::npos) col_name = col_name.substr(dot + 1);
         int pred_col = schema_.col_index(col_name);
-        if (pred_col >= 0 && is_numeric_col(pred_col) &&
-            pred_col < (int)int_cols_.size() && !int_cols_[pred_col].empty()) {
+        if (int_fast(pred_col) && pred_literals_exact(*where)) {
             const int64_t* col_data = int_cols_[pred_col].data();
             const size_t n = rows_meta_.size();
             AliveChecker alive{rows_meta_.data(), (int64_t)std::time(nullptr)};
@@ -789,9 +954,11 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
         // Early-out when no ORDER BY and we have a LIMIT: stop after enough rows
         const bool can_early_out = order_by.empty() && limit >= 0;
         const size_t need = can_early_out ? (size_t)(offset + limit) : SIZE_MAX;
+        BoundPred bw;
+        if (where) bw = bind(*where);
         for (size_t i = 0; i < rows_meta_.size(); ++i) {
             if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-            if (where && !matches_pred(i, *where)) continue;
+            if (where && !eval(i, bw)) continue;
             row_idxs.push_back(i);
             if (row_idxs.size() >= need) break;
         }
@@ -816,8 +983,7 @@ QueryResult Table::scan(const std::vector<std::string>& select_cols,
         // Build a single combined comparator for all keys (left-to-right priority)
         auto cmp = [&](size_t a, size_t b) -> bool {
             for (const auto& k : keys) {
-                const bool use_int = k.numeric && k.col_idx < (int)int_cols_.size() &&
-                                     !int_cols_[k.col_idx].empty();
+                const bool use_int = k.numeric && int_fast(k.col_idx);
                 int r;
                 if (use_int) {
                     int64_t va = int_cols_[k.col_idx][a];
@@ -910,14 +1076,24 @@ int Table::update_rows(const std::vector<std::pair<std::string,std::string>>& as
 
     // Helper: apply assignments to a single row
     auto apply = [&](size_t i) {
+        note_dirty(i);
         for (const auto& [col, val] : assignments) {
             int idx = schema_.col_index(col);
             if (idx >= 0 && idx < num_cols_) {
-                val_ref(i, idx) = arena_.intern(val);
+                const std::string_view old_v = val_ref(i, idx);
+                const std::string_view new_v = arena_.intern(val);
+                if (idx == schema_.pk_col_index && old_v != new_v) {
+                    // The index key is a view into the arena: re-key it BEFORE
+                    // the old bytes are released (they may be madvise()d).
+                    pk_index_.remove(old_v);
+                    pk_index_.insert(new_v, i);
+                }
+                val_ref(i, idx) = new_v;
+                arena_.release(old_v);   // old value's bytes are now dead
                 // Update native int64 column
                 if (is_numeric_col(idx) && idx < (int)int_cols_.size() &&
                     !int_cols_[idx].empty())
-                    int_cols_[idx][i] = parse_int64(val);
+                    store_int(idx, i, val);
             }
         }
     };
@@ -959,11 +1135,13 @@ int Table::update_rows(const std::vector<std::pair<std::string,std::string>>& as
         }
     }
 
-    // General scan
+    // General scan (WHERE bound once, not per row)
     int count = 0;
+    BoundPred bw;
+    if (where) bw = bind(*where);
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-        if (where && !matches_pred(i, *where)) continue;
+        if (where && !eval(i, bw)) continue;
         apply(i);
         ++count;
     }
@@ -975,9 +1153,20 @@ void Table::truncate() {
     std::unique_lock lock(mtx);
     rows_meta_.clear();
     rows_vals_.clear();
-    arena_.clear();
+    {
+        // A sweep may be madvise()ing pages of this arena right now (it holds
+        // release_mtx_, not mtx): wait for it, then unmap and bump the
+        // generation so any page list taken from the old arena is discarded.
+        std::lock_guard rg(release_mtx_);
+        arena_.clear();
+        ++arena_gen_;
+    }
+    if (compacting_) abort_compaction_ = true;   // patching can't express "all gone"
     pk_index_.clear();
     for (auto& ic : int_cols_) ic.clear();
+    std::fill(int_exact_.begin(), int_exact_.end(), 1);
+    dead_rows_ = 0;
+    expiry_buckets_.clear();
 }
 
 // ── Snapshot rows (for persistence) ──────────────────────────────────────────
@@ -997,39 +1186,296 @@ Table::snapshot_rows() const {
     return out;
 }
 
-// ── Compact ───────────────────────────────────────────────────────────────────
-void Table::compact() {
-    std::unique_lock lock(mtx);
+// ── Streaming snapshot writer ─────────────────────────────────────────────────
+bool Table::write_rows(std::ostream& out) const {
+    std::shared_lock lock(mtx);
+    auto put32 = [&](uint32_t v) {
+        char b[4] = {char(v), char(v >> 8), char(v >> 16), char(v >> 24)};
+        out.write(b, 4);
+    };
+    auto put64 = [&](uint64_t v) {
+        char b[8];
+        for (int i = 0; i < 8; ++i) b[i] = char(v >> (i * 8));
+        out.write(b, 8);
+    };
 
-    // Rebuild a fresh arena and both vectors, keeping only live rows.
-    StringArena new_arena;
-    std::vector<RowMeta>          new_meta;
-    std::vector<std::string_view> new_vals;
-    std::vector<std::vector<int64_t>> new_int_cols((size_t)num_cols_);
-    new_meta.reserve(rows_meta_.size());
-    new_vals.reserve(rows_vals_.size());
-    for (int c = 0; c < num_cols_; ++c)
-        if (is_numeric_col(c)) new_int_cols[c].reserve(rows_meta_.size());
-    pk_index_.clear();
+    uint64_t live = 0;
+    for (size_t i = 0; i < rows_meta_.size(); ++i)
+        if (!rows_meta_[i].deleted && !is_expired(rows_meta_[i])) ++live;
+    put64(live);
 
     for (size_t i = 0; i < rows_meta_.size(); ++i) {
         if (rows_meta_[i].deleted || is_expired(rows_meta_[i])) continue;
-        size_t new_idx = new_meta.size();
-        for (int c = 0; c < num_cols_; ++c)
-            new_vals.push_back(new_arena.intern(val_at(i, c)));
-        new_meta.push_back(rows_meta_[i]);
-        // Rebuild int_cols_
-        for (int c = 0; c < num_cols_; ++c)
-            if (is_numeric_col(c) && !int_cols_[c].empty())
-                new_int_cols[c].push_back(int_cols_[c][i]);
-        if (schema_.pk_col_index >= 0)
-            pk_index_.insert(new_vals[new_idx * (size_t)num_cols_ +
-                                      (size_t)schema_.pk_col_index],
-                             new_idx);
+        put64((uint64_t)rows_meta_[i].expires_at);
+        for (int c = 0; c < num_cols_; ++c) {
+            std::string_view v = val_at(i, c);
+            put32((uint32_t)v.size());
+            if (!v.empty()) out.write(v.data(), (std::streamsize)v.size());
+        }
+    }
+    return !!out;
+}
+
+// ── Tiered compaction ─────────────────────────────────────────────────────────
+// See the phase table in table.h. Lock order (no cycles):
+//   sweep_mtx_ → [write gate (shared)] → mtx → release_mtx_
+// release_mtx_ is also taken ALONE by phase 2, which never takes mtx while
+// holding it.
+
+Table::ArenaStats Table::arena_stats() const {
+    std::shared_lock lock(mtx);
+    return {arena_.live_bytes(), arena_.reserved_bytes(),
+            arena_.released_bytes(), arena_.resident_bytes()};
+}
+
+bool Table::rebuild_due() const {
+    const size_t resident = arena_.resident_bytes();
+    const size_t live     = arena_.live_bytes();
+    const size_t waste    = resident > live ? resident - live : 0;
+    return waste >= limits_.min_waste_bytes &&
+           waste * limits_.waste_ratio >= resident;
+}
+
+Table::SweepResult Table::sweep(std::shared_mutex* gate, bool force) {
+    std::lock_guard one_sweep(sweep_mtx_);       // one sweep per table at a time
+    SweepResult res;
+
+    // Phase 0 — peek: cheap check under a SHARED lock (readers unaffected).
+    bool rows_due;
+    {
+        std::shared_lock peek(mtx);
+        rows_due = force || compaction_due();
     }
 
-    arena_     = std::move(new_arena);
-    rows_meta_ = std::move(new_meta);
-    rows_vals_ = std::move(new_vals);
-    int_cols_  = std::move(new_int_cols);
+    // Phase 1 — tier 1: drop dead rows from the arrays (exclusive, short).
+    if (rows_due) {
+        std::shared_lock<std::shared_mutex> g;
+        if (gate) g = std::shared_lock<std::shared_mutex>(*gate);
+        std::unique_lock lock(mtx);
+        // Re-check: the table may have changed between the two locks.
+        if (force || compaction_due()) {
+            compact_rows_locked();
+            res.rows_compacted = true;
+        }
+    }
+
+    // Phase 2 — tier 2: give fully-dead pages back to the OS (no table lock).
+    res.bytes_released = release_dead_pages();
+
+    // Phase 3 — tier 3: only if dead bytes are still scattered across pages.
+    res.arena_rebuilt = rebuild_arena(gate, force);
+    return res;
+}
+
+// Tier 1 — two-pointer pass: live rows slide down (16-byte view copies, no
+// string copies); dead/expired rows' bytes are released to the arena, whose
+// page counters queue any page that becomes fully dead.
+void Table::compact_rows_locked() {
+    const int64_t now    = (int64_t)std::time(nullptr);
+    const size_t  nc     = (size_t)num_cols_;
+    const bool    has_pk = schema_.pk_col_index >= 0;
+    const size_t  pkc    = has_pk ? (size_t)schema_.pk_col_index : 0;
+
+    std::map<int64_t, size_t> buckets;      // expiry buckets of the survivors
+
+    // Row numbers change, but no string moves: record old → new row numbers
+    // and fix the PK index IN PLACE afterwards (one pass over its slots),
+    // instead of re-hashing and re-inserting every surviving key.
+    const bool remap_pk = has_pk && rows_meta_.size() < PrimaryIndex::DROPPED;
+    std::vector<uint32_t> remap;
+    if (remap_pk)    remap.assign(rows_meta_.size(), PrimaryIndex::DROPPED);
+    else if (has_pk) pk_index_.reset(rows_meta_.size() - std::min(dead_rows_, rows_meta_.size()));
+
+    size_t w = 0;                           // write position
+    for (size_t r = 0; r < rows_meta_.size(); ++r) {      // r = read position
+        const RowMeta m = rows_meta_[r];
+        if (m.deleted || (m.expires_at != 0 && m.expires_at <= now)) {
+            for (size_t c = 0; c < nc; ++c) arena_.release(rows_vals_[r * nc + c]);
+            continue;
+        }
+        if (w != r) {
+            rows_meta_[w] = m;
+            std::copy_n(rows_vals_.begin() + (std::ptrdiff_t)(r * nc), nc,
+                        rows_vals_.begin() + (std::ptrdiff_t)(w * nc));
+            for (int c = 0; c < num_cols_; ++c)
+                if (is_numeric_col(c) && !int_cols_[c].empty())
+                    int_cols_[c][w] = int_cols_[c][r];
+        }
+        if (m.expires_at != 0) ++buckets[m.expires_at / 60];
+        if (remap_pk)    remap[r] = (uint32_t)w;
+        else if (has_pk) pk_index_.insert(rows_vals_[w * nc + pkc], w);  // >4G rows fallback
+        ++w;
+    }
+    if (remap_pk) pk_index_.remap_rows(remap);
+    // Deleted/dropped keys left tombstones; if they now outnumber the live
+    // keys, rebuild the index smaller (drops tombstones, shortens chains).
+    if (has_pk) pk_index_.compact_if_sparse();
+
+    rows_meta_.resize(w);
+    rows_vals_.resize(w * nc);
+    for (auto& ic : int_cols_) if (!ic.empty()) ic.resize(w);
+    // The arrays' memory is only returned if we shrink their capacity; do it
+    // when they are mostly empty (one realloc + 16-byte copies).
+    if (rows_meta_.capacity() > 2 * w + 1024) {
+        rows_meta_.shrink_to_fit();
+        rows_vals_.shrink_to_fit();
+        for (auto& ic : int_cols_) ic.shrink_to_fit();
+    }
+
+    dead_rows_      = 0;
+    expiry_buckets_ = std::move(buckets);
+}
+
+// Tier 2 — madvise() the queued dead pages WITHOUT holding the table lock.
+// Safe: a queued page has 0 live bytes (no string_view points into it) and
+// lies behind the bump pointer (nothing will ever be written there again).
+// Only TRUNCATE / an arena swap could unmap it underneath us; both bump
+// arena_gen_ under release_mtx_, which we hold while calling madvise().
+size_t Table::release_dead_pages() {
+    std::vector<char*> pages;
+    uint64_t gen;
+    {
+        std::unique_lock lock(mtx);             // writers push to the list
+        pages = arena_.take_dead_pages();       // O(1) handover (std::exchange)
+        gen   = arena_gen_;
+    }
+    if (pages.empty()) return 0;
+
+    std::lock_guard rg(release_mtx_);
+    if (gen != arena_gen_) return 0;            // arena replaced: pages are gone
+    const size_t n = StringArena::madvise_pages(pages);   // batched ranges
+    arena_.add_released(n);
+    return n;
+}
+
+// Tier 3 — rebuild the arena aside under a SHARED lock (readers keep running;
+// writers wait), then patch the writes made in the gap before the exclusive
+// lock and swap. Freeing the old arena happens after the lock is released.
+bool Table::rebuild_arena(std::shared_mutex* gate, bool force) {
+    const size_t nc     = (size_t)num_cols_;
+    const bool   has_pk = schema_.pk_col_index >= 0;
+    const size_t pkc    = has_pk ? (size_t)schema_.pk_col_index : 0;
+
+    // The copy. Declared out here: after the swap these hold the OLD data,
+    // which is then freed when the function returns — outside the lock.
+    StringArena                       n_arena;
+    std::vector<RowMeta>              n_meta;
+    std::vector<std::string_view>     n_vals;
+    std::vector<std::vector<int64_t>> n_ints((size_t)num_cols_);
+    PrimaryIndex                      n_pk;
+    std::vector<long long>            remap;      // old row → new row, -1 = dropped
+    size_t                            old_count = 0;
+
+    // Append live row r (current numbering) to the copy; returns its new index.
+    auto copy_row = [&](size_t r) -> long long {
+        const size_t n = n_meta.size();
+        n_meta.push_back(rows_meta_[r]);
+        for (size_t c = 0; c < nc; ++c)
+            n_vals.push_back(n_arena.intern(rows_vals_[r * nc + c]));
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c) && !int_cols_[c].empty())
+                n_ints[c].push_back(int_cols_[c][r]);
+        if (has_pk) n_pk.insert(n_vals[n * nc + pkc], n);
+        return (long long)n;
+    };
+
+    // ── A. Build under a SHARED lock ─────────────────────────────────────────
+    {
+        std::shared_lock lock(mtx);
+        if (rows_meta_.empty()) return false;
+        if (!force && !rebuild_due()) return false;
+        // Writers are blocked while we hold the shared lock, so only this
+        // thread touches these fields now; writers read them under exclusive.
+        compacting_       = true;
+        abort_compaction_ = false;
+        dirty_rows_.clear();
+        old_count = rows_meta_.size();
+
+        const int64_t now = (int64_t)std::time(nullptr);
+        n_meta.reserve(old_count);
+        n_vals.reserve(old_count * nc);
+        remap.assign(old_count, -1);
+        if (has_pk) n_pk.reset(old_count - std::min(dead_rows_, old_count));
+        for (size_t r = 0; r < old_count; ++r) {
+            const RowMeta& m = rows_meta_[r];
+            if (m.deleted || (m.expires_at != 0 && m.expires_at <= now)) continue;
+            remap[r] = copy_row(r);
+        }
+    }
+
+    // ── The gap: no table lock held — writers may run here ───────────────────
+    if (rebuild_gap_hook_) rebuild_gap_hook_();
+
+    // ── B. Patch + swap under an EXCLUSIVE lock (microseconds normally) ──────
+    std::shared_lock<std::shared_mutex> g;
+    if (gate) g = std::shared_lock<std::shared_mutex>(*gate);
+    std::unique_lock lock(mtx);
+    compacting_ = false;
+    std::vector<size_t> dirty = std::exchange(dirty_rows_, {});
+    if (abort_compaction_ || dirty.size() > old_count / 2 + 1024) {
+        // TRUNCATE in the gap, or so many changes that patching ≈ rebuilding:
+        // discard the copy and try again at the next sweep.
+        abort_compaction_ = false;
+        return false;
+    }
+
+    // Order matters for the PK index of the copy: first REMOVE every key that
+    // went away in the gap (deleted rows, changed PKs), and only then INSERT
+    // the new keys. Otherwise "DELETE k; INSERT k" in the gap would try to add
+    // k while the dead row still holds it, leaving the new row unindexed.
+
+    // (a) Rows UPDATEd / DELETEd in the gap (old numbering, via remap):
+    //     apply the changes, remove stale keys, remember keys to re-insert.
+    size_t dead = 0;
+    std::vector<size_t> rekey;                        // copy rows needing a PK insert
+    for (size_t r : dirty) {
+        if (r >= old_count) continue;                 // appended: copied in (c)
+        const long long n = remap[r];
+        if (n < 0) continue;                          // was already dead at build
+        RowMeta& nm = n_meta[(size_t)n];
+        if (nm.deleted) continue;                     // patched already (dup entry)
+        if (rows_meta_[r].deleted) {                  // DELETE in the gap
+            nm.deleted = true;
+            ++dead;
+            if (has_pk) n_pk.remove(n_vals[(size_t)n * nc + pkc]);
+            continue;
+        }
+        for (size_t c = 0; c < nc; ++c) {             // UPDATE in the gap
+            std::string_view& nv  = n_vals[(size_t)n * nc + c];
+            const std::string_view cur = rows_vals_[r * nc + c];
+            if (nv == cur) continue;
+            const bool is_pk = has_pk && c == pkc;
+            if (is_pk) { n_pk.remove(nv); rekey.push_back((size_t)n); }  // before its bytes go
+            n_arena.release(nv);
+            nv = n_arena.intern(cur);
+        }
+        for (int c = 0; c < num_cols_; ++c)
+            if (is_numeric_col(c) && !int_cols_[c].empty())
+                n_ints[c][(size_t)n] = int_cols_[c][r];
+    }
+    // (b) Insert the changed PKs (all stale keys are gone now).
+    for (size_t n : rekey)
+        if (!n_meta[n].deleted) n_pk.insert(n_vals[n * nc + pkc], n);
+
+    // (c) Rows INSERTed in the gap were appended: copy them as they are now.
+    for (size_t r = old_count; r < rows_meta_.size(); ++r)
+        if (!rows_meta_[r].deleted) copy_row(r);
+
+    // (c) Swap. The old structures move into the n_* locals.
+    {
+        std::lock_guard rg(release_mtx_);             // vs a concurrent madvise
+        std::swap(arena_, n_arena);
+        ++arena_gen_;                                 // old page lists are void
+    }
+    std::swap(rows_meta_, n_meta);
+    std::swap(rows_vals_, n_vals);
+    std::swap(int_cols_,  n_ints);
+    std::swap(pk_index_,  n_pk);
+    dead_rows_ = dead;
+    expiry_buckets_.clear();
+    for (const auto& m : rows_meta_)
+        if (!m.deleted && m.expires_at != 0) ++expiry_buckets_[m.expires_at / 60];
+    lock.unlock();
+    g = {};
+    return true;   // old arena + arrays (now in n_*) freed here, unlocked
 }
