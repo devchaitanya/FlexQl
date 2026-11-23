@@ -221,15 +221,27 @@ During scan, rows where `expires_at > 0 && expires_at <= now()` are silently ski
 
 ### Multithreading
 
-**Choice: Fixed thread pool + per-table `shared_mutex` + single WAL mutex**
+**Choice: epoll event loop + fixed thread pool + per-table `shared_mutex` + single WAL mutex**
 
 ```
-accept() loop (main thread)
-    └── submit(client_fd) → ThreadPool (N = hardware_concurrency workers)
-            ├── Thread 0: handle_client(fd_A) — parse → WAL append → execute
-            ├── Thread 1: handle_client(fd_B)
-            └── ...
+event thread (main):  epoll_wait over the listen socket + every client socket (non-blocking)
+    ├── new connection        → accept, register (EPOLLONESHOT)
+    ├── client readable       → append bytes to that client's buffer
+    │                           complete statement (ends with ';')? → submit ONE query
+    └── worker finished       → re-arm that client's socket
+ThreadPool (N = hardware_concurrency workers), one job = one query:
+    parse → [write gate + WAL append] → execute → send reply → hand the socket back
 ```
+
+- **Idle connections cost no thread:** a worker is busy only while running a query, so
+  hundreds of idle clients don't block anyone (tested: 900 idle clients on 2 workers, a new
+  query is still answered in ~0.5 ms; the previous thread-per-connection server hung as soon
+  as idle clients = workers).
+- **Per-client ordering:** a client's socket is disarmed while its query runs, so its
+  statements execute one at a time and replies come back in order.
+- **Trade-off:** one extra thread handoff per query (~6–8 µs on loopback); tiny-query
+  throughput is bounded by the single event thread (~250–270k queries/s vs ~470k before).
+  Real queries (≥0.5 ms) are unaffected.
 
 - **SELECT** acquires `shared_lock` — multiple concurrent readers
 - **INSERT/UPDATE/DELETE/compact** acquire `unique_lock` — exclusive writer

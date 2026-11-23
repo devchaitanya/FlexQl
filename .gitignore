@@ -53,3 +53,5 @@ REVISION_NOTES.pdf
 # Compiled bench binaries
 bench/server
 bench/new_benchmark
+INTERVIEW_CONCEPTS.pdf
+INTERVIEW_CONCEPTS.tex

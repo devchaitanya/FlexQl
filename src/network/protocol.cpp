@@ -1,6 +1,8 @@
 #include "network/protocol.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <poll.h>
+#include <cerrno>
 #include <cstring>
 
 namespace protocol {
@@ -91,8 +93,18 @@ bool send_all(int fd, const std::string& msg) {
     size_t total = 0;
     while (total < msg.size()) {
         ssize_t n = ::send(fd, msg.data() + total, msg.size() - total, MSG_NOSIGNAL);
-        if (n <= 0) return false;
-        total += n;
+        if (n > 0) { total += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Server sockets are non-blocking (epoll). The kernel send buffer is
+            // full (e.g. a large SELECT to a slow reader): wait until writable.
+            // If the peer is gone, poll reports POLLHUP/POLLERR and the next
+            // send() fails with a real error.
+            pollfd pfd{fd, POLLOUT, 0};
+            if (::poll(&pfd, 1, -1) < 0 && errno != EINTR) return false;
+            continue;
+        }
+        return false;
     }
     return true;
 }
@@ -104,9 +116,6 @@ std::string recv_sql(int fd) {
     sql.clear();
     if (sql.capacity() < 2 * 1024 * 1024)
         sql.reserve(2 * 1024 * 1024);
-
-    // Maximum SQL message size (16 MB) to prevent OOM from malicious clients
-    static constexpr size_t MAX_SQL_SIZE = 16 * 1024 * 1024;
 
     // 256 KB recv buffer — cuts syscall count from ~22 to ~6 per 1.4MB batch.
     static thread_local char buf[256 * 1024];

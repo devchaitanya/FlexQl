@@ -28,7 +28,7 @@ Client (REPL / benchmark)
         │  TCP socket  (raw SQL text terminated by ';')
         ▼
  flexql-server
-  ├─ Thread Pool (N = hardware_concurrency workers)
+  ├─ epoll event loop → Thread Pool (N = hardware_concurrency workers, one job per query)
   ├─ Parser  →  Executor
   ├─ Table Storage  (columnar StringArena + flat arrays)
   ├─ LRU Query Cache
@@ -136,8 +136,12 @@ This two-phase approach (logical deletion → background physical removal) avoid
 
 ## 6. Multithreading Design
 
-### Thread Pool
-`ThreadPool` in `include/concurrency/thread_pool.h` creates `hardware_concurrency()` worker threads (configurable via `threads` in `server.conf`). Each accepted TCP connection is dispatched to a free worker via a `std::queue` protected by `std::mutex` + `std::condition_variable`.
+### Event loop + Thread Pool
+The server is event-driven. The main thread runs an `epoll` loop over the listening socket and every client socket (all non-blocking). It reads arriving bytes into a per-client buffer and, once a complete statement (ending in `;`) has arrived, submits **one query** to the `ThreadPool` (`include/concurrency/thread_pool.h`, `hardware_concurrency()` workers, a `std::queue` protected by `std::mutex` + `std::condition_variable`).
+
+A worker parses, logs (WAL) and executes the statement, sends the reply, and hands the socket back to the event thread, which re-arms it. Client sockets use `EPOLLONESHOT`, so a client's socket is disarmed while its query runs: its statements run one at a time and replies stay in order. Only the event thread changes epoll registrations or closes client sockets; workers return sockets through a mutex-protected queue and an `eventfd` wake-up.
+
+Idle connections hold no worker (900 idle clients on 2 workers: a new query is still answered in ~0.5 ms). The cost is one extra thread handoff per query (~6–8 µs on loopback), and tiny-query throughput is bounded by the single event thread.
 
 ### Per-Table `shared_mutex`
 Every `Table` has a `mutable std::shared_mutex mtx`:

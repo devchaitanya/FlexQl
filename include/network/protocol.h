@@ -21,13 +21,17 @@
 
 namespace protocol {
 
+// Maximum size of one SQL statement (16 MB) to prevent OOM from malicious clients.
+inline constexpr size_t MAX_SQL_SIZE = 16 * 1024 * 1024;
+
 // Encode a QueryResult into a wire response string.
 std::string encode_response(const QueryResult& res);
 
 // Stream a QueryResult to fd in chunks (avoids building a multi-GB string).
 bool stream_response(int fd, const QueryResult& res);
 
-// Send all bytes of msg over fd. Returns false on error.
+// Send all bytes of msg over fd. Works on blocking and non-blocking sockets
+// (waits with poll() when the send buffer is full). Returns false on error.
 bool send_all(int fd, const std::string& msg);
 
 // Receive a length-prefixed SQL string from fd.

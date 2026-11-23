@@ -31,7 +31,7 @@ SERVER_OBJS := $(patsubst src/%.cpp, $(BUILD)/%.o, $(SERVER_SRCS))
 CLIENT_OBJS := $(patsubst src/%.cpp, $(BUILD)/%.o, $(CLIENT_SRCS))
 
 # ── Targets ───────────────────────────────────────────────────────────────────
-.PHONY: all server client clean compile_commands test test-asan test-tsan
+.PHONY: all server client clean compile_commands test test-asan test-tsan test-server test-server-asan test-server-tsan
 
 all: server client
 
@@ -108,6 +108,27 @@ test-tsan:
 	    -Wall -Wextra -pthread -Iinclude -Isrc/client \
 	    $(TEST_SRCS) -o $(BIN)/flexql-test-tsan
 	TSAN_OPTIONS=abort_on_error=1 $(BIN)/flexql-test-tsan
+
+# ── Server (epoll) integration tests ─────────────────────────────────────────
+# A real TcpServer in-process, driven over sockets: idle clients, split and
+# large statements, per-client ordering, concurrency, disconnects, shutdown.
+SERVER_TEST_SRCS := tests/test_server.cpp $(COMMON_SRCS)
+
+test-server:
+	$(CXX) $(CXXFLAGS) $(SERVER_TEST_SRCS) -o $(BIN)/flexql-test-server
+	$(BIN)/flexql-test-server
+
+test-server-asan:
+	$(CXX) -std=c++17 -march=native -g -O1 -fsanitize=address -fno-omit-frame-pointer \
+	    -Wall -Wextra -pthread -Iinclude -Isrc/client \
+	    $(SERVER_TEST_SRCS) -o $(BIN)/flexql-test-server-asan
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 $(BIN)/flexql-test-server-asan
+
+test-server-tsan:
+	$(CXX) -std=c++17 -march=native -g -O1 -fsanitize=thread \
+	    -Wall -Wextra -pthread -Iinclude -Isrc/client \
+	    $(SERVER_TEST_SRCS) -o $(BIN)/flexql-test-server-tsan
+	TSAN_OPTIONS=abort_on_error=1 $(BIN)/flexql-test-server-tsan
 
 # Regenerate compile_commands.json for clangd IDE support
 compile_commands:
